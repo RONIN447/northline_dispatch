@@ -9,11 +9,11 @@ Compare driving routes using forecast weather, truck load, and travel time. Revi
 <p>
   <a href="https://northline-frontend.onrender.com/"><strong>Launch the live application</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/RONIN447/northline_dispatch_ops">Source code</a>
+  <a href="https://github.com/RONIN447/northline_dispatch">Source code</a>
 </p>
 
 <p>
-  <a href="https://github.com/RONIN447/northline_dispatch_ops/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch_ops/ci.yml?branch=master&label=CI" alt="CI status"></a>
+  <a href="https://github.com/RONIN447/northline_dispatch/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch/ci.yml?branch=main&label=CI" alt="CI status"></a>
   <a href="https://northline-frontend.onrender.com/"><img src="https://img.shields.io/badge/demo-live-155f50" alt="Live demo"></a>
   <img src="https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb" alt="React and Vite">
   <img src="https://img.shields.io/badge/backend-Django-092e20" alt="Django">
@@ -152,14 +152,33 @@ Run the backend regression tests:
 
 ```powershell
 cd backend
-python -m unittest routing.test_risk_rules briefing.tests evals.test_scenarios
+python -m unittest routing.test_risk_rules briefing.tests evals.test_scenarios evals.test_checks evals.test_runner
 python -m evals.build_scenarios
+python -m django run_evals --gate
 ```
 
 The briefing tests validate the captured route-plan responses against the
 Python 3.9-compatible Pydantic models. The scenario generator rebuilds the
 golden dataset from `evals/scenarios/raw/`, uses the routing engine for risk
-and recommendation calculations, and prints a review table.
+and recommendation calculations, includes a machine-checkable `expect` block
+per scenario, and prints a review table. The evaluator runs all scenarios
+through the configured provider, checks both raw and validator-corrected
+briefings, and writes check pass rates, intervention counts, and fallback
+counts to `evals/reports/latest.md`. The report's final pass rates demonstrate
+the validator's behavior, not independent model quality; compare raw pass rates
+and correction rates when assessing model performance.
+
+The CI quality gate requires 100% final pass rates for all seven configured
+checks in `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`;
+that verifies the evaluation pipeline and deterministic guardrails only, not
+the quality of a real model's raw output. Run `python -m django run_evals`
+without `--gate` to generate a report locally without enforcing thresholds.
+
+The gate was verified with an intentionally broken validator and
+`MOCK_MODE=faulty_number` on a temporary branch. The run failed as expected on
+the `numbers_grounded` threshold.
+
+![GitHub Actions showing the intentional evaluation-gate failure](docs/images/eval-gate-failure.png)
 
 ### Briefing providers
 
@@ -170,7 +189,8 @@ It defaults to the deterministic mock provider:
 ```powershell
 $env:LLM_PROVIDER = "mock"
 $env:MOCK_MODE = "normal" # faulty_route, faulty_missing_checkpoint, faulty_number,
-                          # faulty_downgrade, faulty_no_gap each exercise one check
+                          # faulty_downgrade, faulty_no_gap, faulty_route_id,
+                          # faulty_place each exercise a specific check
 ```
 
 Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`, or
@@ -208,7 +228,7 @@ npm ci
 npm run build
 ```
 
-GitHub Actions runs the backend tests on Python 3.9 and 3.14 and verifies a production frontend build on pushes and pull requests.
+GitHub Actions runs the backend tests, including faulty-output checks and report generation, on Python 3.9 and 3.14 and verifies a production frontend build on pushes and pull requests.
 
 ## Deployment
 
