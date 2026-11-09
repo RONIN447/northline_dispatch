@@ -48,15 +48,15 @@ class MockProvider:
             "faulty_number",
             "faulty_downgrade",
             "faulty_no_gap",
-            "faulty_place",
-            "faulty_route_id",
             "faulty_safe",
+            "faulty_route_id",
+            "faulty_place",
         }:
             raise ValueError(
                 "MOCK_MODE must be 'normal', 'faulty', 'faulty_route', "
                 "'faulty_missing_checkpoint', 'faulty_number', "
-                "'faulty_downgrade', 'faulty_no_gap', 'faulty_place', "
-                "'faulty_route_id', or 'faulty_safe'."
+                "'faulty_downgrade', 'faulty_no_gap', 'faulty_safe', "
+                "'faulty_route_id', or 'faulty_place'."
             )
 
     def generate(self, system: str, user: str) -> ProviderResponse:
@@ -82,12 +82,12 @@ class MockProvider:
             briefing = self._make_faulty_downgrade(briefing)
         elif self.mode == "faulty_no_gap":
             briefing.data_gaps = []
-        elif self.mode == "faulty_place":
-            briefing.dispatcher_actions.append("Reroute through Phoenix.")
-        elif self.mode == "faulty_route_id":
-            briefing.dispatcher_actions.append("Route route-999 is faster.")
         elif self.mode == "faulty_safe":
             briefing.dispatcher_actions.append("This route is safe to travel.")
+        elif self.mode == "faulty_route_id":
+            briefing.dispatcher_actions.append("Route route-999 is faster.")
+        elif self.mode == "faulty_place":
+            briefing.dispatcher_actions.append("Reroute through Phoenix.")
         text = briefing.model_dump_json()
         return ProviderResponse(
             text=text,

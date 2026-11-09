@@ -9,11 +9,11 @@ Compare driving routes using forecast weather, truck load, and travel time. Revi
 <p>
   <a href="https://northline-frontend.onrender.com/"><strong>Launch the live application</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/RONIN447/northline_dispatch_ops">Source code</a>
+  <a href="https://github.com/RONIN447/northline_dispatch">Source code</a>
 </p>
 
 <p>
-  <a href="https://github.com/RONIN447/northline_dispatch_ops/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch_ops/ci.yml?branch=master&label=CI" alt="CI status"></a>
+  <a href="https://github.com/RONIN447/northline_dispatch/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch/ci.yml?branch=main&label=CI" alt="CI status"></a>
   <a href="https://northline-frontend.onrender.com/"><img src="https://img.shields.io/badge/demo-live-155f50" alt="Live demo"></a>
   <img src="https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb" alt="React and Vite">
   <img src="https://img.shields.io/badge/backend-Django-092e20" alt="Django">
@@ -176,7 +176,7 @@ without `--gate` to generate a report locally without enforcing thresholds.
 
 The gate was verified with an intentionally broken validator and
 `MOCK_MODE=faulty_number` on a temporary branch. The run failed as expected on
-the `numbers_grounded` threshold: [GitHub Actions run #38](https://github.com/RONIN447/northline_dispatch_ops/actions/runs/40180426467).
+the `numbers_grounded` threshold.
 
 ![GitHub Actions showing the intentional evaluation-gate failure](docs/images/eval-gate-failure.png)
 

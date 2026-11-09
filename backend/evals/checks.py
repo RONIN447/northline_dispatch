@@ -45,7 +45,6 @@ def validate_briefing(briefing: Briefing, route_plan: dict) -> List[str]:
 
     if _has_false_safe_claim(briefing, route_plan):
         errors.append("false_safe_claim")
-
     errors.extend(check_grounding(briefing, route_plan))
     return errors
 
@@ -99,7 +98,6 @@ def evaluate_checks(briefing: Briefing, route_plan: dict) -> Dict[str, bool]:
         for (route_id, index), levels in actual.items()
         for level in levels
     }
-    severe_coverage = severe_expected.issubset(actual_exact)
     no_downgrade = True
     for (route_id, index), levels in actual.items():
         route = routes_by_id.get(route_id)
@@ -118,21 +116,20 @@ def evaluate_checks(briefing: Briefing, route_plan: dict) -> Dict[str, bool]:
             no_downgrade = False
 
     expected_gaps = set(expected_data_gaps(route_plan))
-    false_safe_claim = _has_false_safe_claim(briefing, route_plan)
     grounding_errors = check_grounding(briefing, route_plan)
     return {
         "route_matches_engine": (
             briefing.recommended_route_id == route_plan["recommendedRouteId"]
             and briefing.recommended_route_id in route_ids
         ),
-        "severe_coverage": severe_coverage,
+        "severe_coverage": severe_expected.issubset(actual_exact),
         "no_risk_downgrade": no_downgrade,
         "no_false_safe": (
             set(expected) == set(actual)
             and sum(len(levels) for levels in actual.values())
             == len(briefing.risky_checkpoints)
             and expected_gaps == set(briefing.data_gaps)
-            and not false_safe_claim
+            and not _has_false_safe_claim(briefing, route_plan)
         ),
         "numbers_grounded": "unsupported_number" not in grounding_errors,
         "route_ids_grounded": "unsupported_route_id" not in grounding_errors,
