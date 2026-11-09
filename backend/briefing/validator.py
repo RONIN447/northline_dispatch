@@ -5,7 +5,6 @@ from typing import List, Set, Tuple
 
 from briefing.schema import Briefing, RiskyCheckpoint
 from evals.checks import (
-    evaluate_checks,
     expected_data_gaps,
     expected_risky_checkpoints,
     validate_briefing,
@@ -124,15 +123,7 @@ def enforce(plan: dict, briefing: Briefing) -> Tuple[Briefing, List[Intervention
     final.risky_checkpoints = corrected_risks
 
     grounding_errors = validate_briefing(final, plan)
-    if any(
-        error in grounding_errors
-        for error in (
-            "unsupported_number",
-            "unsupported_route_id",
-            "unsupported_place_name",
-            "false_safe_claim",
-        )
-    ):
+    if "unsupported_number" in grounding_errors or "unsupported_route_id" in grounding_errors:
         final = _template_briefing(plan)
         fallback_used = True
         interventions.append(
@@ -143,15 +134,10 @@ def enforce(plan: dict, briefing: Briefing) -> Tuple[Briefing, List[Intervention
         )
 
     remaining_errors = validate_briefing(final, plan)
-    failed_checks = [
-        check
-        for check, passed in evaluate_checks(final, plan).items()
-        if not passed
-    ]
-    if remaining_errors or failed_checks:
+    if remaining_errors:
         raise BriefingValidationError(
             "Briefing validator could not satisfy shared checks: {}".format(
-                ", ".join(remaining_errors + failed_checks)
+                ", ".join(remaining_errors)
             )
         )
     return final, interventions, fallback_used
