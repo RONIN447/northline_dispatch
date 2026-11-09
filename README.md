@@ -9,11 +9,11 @@ Compare driving routes using forecast weather, truck load, and travel time. Revi
 <p>
   <a href="https://northline-frontend.onrender.com/"><strong>Launch the live application</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/RONIN447/northline_dispatch">Source code</a>
+  <a href="https://github.com/RONIN447/northline_dispatch_ops">Source code</a>
 </p>
 
 <p>
-  <a href="https://github.com/RONIN447/northline_dispatch/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch/ci.yml?branch=main&label=CI" alt="CI status"></a>
+  <a href="https://github.com/RONIN447/northline_dispatch_ops/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch_ops/ci.yml?branch=master&label=CI" alt="CI status"></a>
   <a href="https://northline-frontend.onrender.com/"><img src="https://img.shields.io/badge/demo-live-155f50" alt="Live demo"></a>
   <img src="https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb" alt="React and Vite">
   <img src="https://img.shields.io/badge/backend-Django-092e20" alt="Django">
@@ -43,7 +43,6 @@ Dispatchers enter an origin, destination, departure time, cargo weight, and chec
 - **Arrival-time forecasts:** estimates when the truck reaches each checkpoint and uses the nearest available hourly forecast.
 - **Load-aware risk:** applies cargo-weight adjustments to the weather risk assessment.
 - **Explainable recommendations:** ranks route options using severe exposure first, followed by high-risk miles, distance-weighted average risk, and duration.
-- **Guarded AI dispatch briefings:** turns an engine-generated route plan into a dispatcher briefing, then validates and corrects it with deterministic safety rules.
 - **Interactive map:** displays route geometry, checkpoint conditions, risk overlays, and a 0-48 hour departure forecast.
 - **Fail-safe forecast gaps:** missing wind, rain, or snow data is reported explicitly and raises checkpoint risk to at least Severe; a checkpoint with all three unavailable is No Travel.
 
@@ -68,11 +67,7 @@ flowchart LR
     API -->|geocode| Geo[Open-Meteo Geocoding]
     API -->|driving alternatives| OSRM[OSRM]
     API -->|checkpoint forecasts| Weather[Open-Meteo Forecast]
-    API -->|engine-ranked routes + weather| Web
-    Web -->|POST /api/briefing/ + route plan| Briefing[Django briefing API]
-    Briefing -->|prompt| Provider[Configured briefing provider]
-    Provider -->|generated briefing| Guard[Schema validation + deterministic safety validator]
-    Guard -->|briefing + corrections| Web
+    API -->|ranked routes + weather| Web
     Web -->|route and risk layers| Map[Leaflet map]
 ```
 
@@ -83,12 +78,6 @@ flowchart LR
 | Route provider | OSRM public routing service |
 | Geocoding and weather | Open-Meteo APIs |
 | Hosting | Render static site and web service |
-
-## Design decisions
-
-- **The routing engine remains authoritative.** It calculates checkpoint risks, scores routes, and selects the recommendation. The language model explains the resulting plan; it does not choose or change the recommended route.
-- **Briefings are bounded decision support.** The briefing provider receives route summaries and checkpoint weather/risk data, not route geometry. Its output must match the briefing schema and is checked by deterministic rules; unsafe or unsupported content can be corrected or replaced with a fallback.
-- **Safety checks do not depend on model behavior.** The same evaluation checks validate generated and corrected briefings. CI uses a deterministic mock to exercise this pipeline and its guardrails, not to measure real-model quality.
 
 ## Run locally
 
@@ -134,7 +123,7 @@ Environment variable examples are documented in [`.env.example`](./.env.example)
 | --- | --- | --- |
 | `GET` | `/api/health/` | Render health check; returns `{"status":"ok"}` |
 | `POST` | `/api/plan/` | Geocode locations, score available routes, and return the recommendation |
-| `POST` | `/api/briefing/` | Generate an AI dispatch briefing from the route plan, then apply deterministic safety validation |
+| `POST` | `/api/briefing/` | Generate and validate a dispatch briefing from a route-plan JSON body |
 
 Example request:
 
@@ -163,75 +152,14 @@ Run the backend regression tests:
 
 ```powershell
 cd backend
-python -m unittest routing.test_risk_rules briefing.tests evals.test_scenarios evals.test_checks evals.test_runner
+python -m unittest routing.test_risk_rules briefing.tests evals.test_scenarios
 python -m evals.build_scenarios
-python -m django run_evals --gate
-```
-
-Export one CSV row per failed raw check, including the model output and the
-validator's corrected output, by adding `--failure-analysis`:
-
-```powershell
-python -m django run_evals --failure-analysis evals/failure_analysis_v1.csv
 ```
 
 The briefing tests validate the captured route-plan responses against the
 Python 3.9-compatible Pydantic models. The scenario generator rebuilds the
 golden dataset from `evals/scenarios/raw/`, uses the routing engine for risk
-and recommendation calculations, includes a machine-checkable `expect` block
-per scenario, and prints a review table. The evaluator runs all scenarios
-through the configured provider, checks both raw and validator-corrected
-briefings, and writes check pass rates, intervention counts, and fallback
-counts to `evals/reports/latest.md`. It also writes one diagnostic JSONL line
-per scenario to `evals/reports/raw/<run-id>.jsonl`, including raw and parsed
-model output, failed checks and their offending grounding tokens, token usage,
-latency, finish reason, retries, and validator interventions. Use `--limit N`
-and `--category CATEGORY` to run a subset; category IDs and report labels are
-accepted (for example, `--limit 3 --category severe`). The report summarizes
-raw check pass rates, fallback/retry rates, latency percentiles, and average
-token usage; intervention counts are grouped by rule. The report's final pass rates demonstrate
-the validator's behavior, not independent model quality; compare raw pass rates
-and correction rates when assessing model performance.
-
-#### Grounding detector allowances
-
-The grounding checks accept numeric values directly present in route-level
-metadata or checkpoint fields, including distances, durations, weather values,
-risk metrics, and mile markers. They also accept checkpoint indices (zero-based),
-each route's checkpoint count, the total checkpoint count, numeric components
-of route arrival and checkpoint ETA/forecast-hour strings, per-route sums of
-mile markers, and cross-route sums of fields whose names end in `Miles`.
-For each accepted numeric value, the detector also accepts rounding to the
-nearest whole number or tenth using half-up rounding; no broader numeric
-tolerance is applied.
-
-Route IDs are matched case-insensitively after removing separators, and the
-`route-<number>` alias is accepted when it identifies a route in the plan.
-Place-name words are grounded in the plan's origin/destination fields and route
-summaries; configured ordinary briefing words are ignored as place names.
-
-The CI quality gate requires 100% final pass rates for all seven configured
-checks in `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`.
-This verifies the evaluation pipeline and deterministic guardrails; **it does
-not measure real-model quality**. The mock is rule-based and is not a hosted
-language model. The committed [evaluation report](./backend/evals/reports/latest.md)
-is from the mock provider, so its raw pass rates must not be interpreted as
-evidence of real-model performance. Run `python -m django run_evals --output
-evals/reports/real_model_v1.md` without `--gate` using a hosted provider to
-generate a real-model report. Reports include provider, model, prompt version,
-UTC date, overall raw/final rates, and raw/final rates by scenario category.
-
-The mock run covered 28 scenarios and passed all seven checks on both raw and
-validator-corrected output (100% each); the validator made no interventions.
-These results confirm the mock-backed test pipeline only.
-
-![Mock evaluation results: 28 scenarios and seven checks passed](docs/images/eval-results.svg)
-
-The gate was also exercised with an intentionally broken validator and
-`MOCK_MODE=faulty_number` on a temporary branch. CI failed as expected on the
-`numbers_grounded` threshold.
-
-![GitHub Actions showing the intentional evaluation-gate failure](docs/images/eval-gate-failure.png)
+and recommendation calculations, and prints a review table.
 
 ### Briefing providers
 
@@ -242,44 +170,18 @@ It defaults to the deterministic mock provider:
 ```powershell
 $env:LLM_PROVIDER = "mock"
 $env:MOCK_MODE = "normal" # faulty_route, faulty_missing_checkpoint, faulty_number,
-                          # faulty_downgrade, faulty_no_gap, faulty_route_id,
-                          # faulty_place each exercise a specific check
+                          # faulty_downgrade, faulty_no_gap each exercise one check
 ```
 
-Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`,
-`LLM_PROVIDER=openai` with `OPENAI_API_KEY` and `OPENAI_MODEL`,
-`LLM_PROVIDER=groq` with `GROQ_API_KEY` and `GROQ_MODEL`, or
-`LLM_PROVIDER=gemini` with `GEMINI_API_KEY` and `GEMINI_MODEL` to call a hosted
-model. Groq uses its OpenAI-compatible chat-completions API. SDK imports are
-lazy, and provider requests have a 20-second timeout inside a 45-second
-Gunicorn worker timeout.
-
-For local development, Python loads the ignored repository-root `.env` file.
-Add `LLM_PROVIDER=groq` and `GROQ_MODEL=<model ID>` there; store your key as
-`GROQ_API_KEY=<key>`. To avoid entering a key into a file, you can instead set
-these variables in PowerShell. Choose an active chat-completion model from your
-GroqCloud account.
-
-```powershell
-Set-Location 'C:\path\to\northline_dispatch\backend'
-$env:LLM_PROVIDER = "groq"
-$secret = Read-Host "Groq API key" -AsSecureString
-$env:GROQ_API_KEY = (New-Object System.Net.NetworkCredential("", $secret)).Password
-$env:GROQ_MODEL = "llama-3.3-70b-versatile"
-$env:DJANGO_SETTINGS_MODULE = "settings"
-python -m django run_evals --output evals/reports/real_model_v1.md
-```
-
-Run without `--gate` to save the real-model report even if it misses the mock
-CI thresholds. Never commit `.env` or paste the key into chat. The Groq sample
-completion belongs in a standalone script or terminal, not in `routing/apps.py`;
-Django imports that module at startup and must not make provider calls there.
-
+Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`, or
+`LLM_PROVIDER=openai` with `OPENAI_API_KEY` and `OPENAI_MODEL`, to call a hosted
+model. SDK imports are lazy, and provider requests have a 20-second timeout
+inside a 45-second Gunicorn worker timeout.
 Production requires an explicit `LLM_PROVIDER`; leaving it unset disables briefing
 generation with a configuration response. Responses identify the selected provider
-and model in metadata, including `mock` / `rule-based` when the mock is selected.
-Set provider usage or spending limits in the selected provider dashboard as an
-additional cost safeguard.
+and model in metadata, including `mock` / `rule-based` when the mock is selected. Set
+provider spending limits in the Anthropic or OpenAI dashboard as an additional cost
+safeguard.
 
 `briefing.service.generate_briefing(plan)` sends only route summaries and
 checkpoint weather/risk data (not route geometry), bounds location labels, and
@@ -306,7 +208,7 @@ npm ci
 npm run build
 ```
 
-GitHub Actions runs the backend tests, including faulty-output checks and report generation, on Python 3.9 and 3.14 and verifies a production frontend build on pushes and pull requests.
+GitHub Actions runs the backend tests on Python 3.9 and 3.14 and verifies a production frontend build on pushes and pull requests.
 
 ## Deployment
 
@@ -321,7 +223,6 @@ The frontend reads `VITE_API_BASE_URL` at build time; redeploy it after changing
 
 ## Limitations and safety
 
-- The briefing is AI-generated decision support, not an authoritative dispatch decision or a guarantee of road safety. Verify route and weather conditions, follow current carrier policy, official road advisories, and applicable regulations before dispatch.
 - `/api/briefing/` trusts the route-plan JSON submitted by the caller; it does not recompute trips or independently verify caller-supplied route and weather data. The response is only grounded in that submitted plan. The per-IP rate limit helps control provider cost; recomputing plans server-side is deferred.
 - Briefing requests are limited to 10 per client IP per minute and 500 per UTC day in the running process. The daily in-memory ceiling resets on process restart and is not shared across multiple workers or instances; provider dashboard spending limits are the durable cost backstop.
 - OSRM and Open-Meteo public services are demonstration providers and may be subject to availability or rate limits.
@@ -344,7 +245,7 @@ backend/
   urls.py
   wsgi.py
 docs/
-  images/                # Application screenshots and evaluation visuals
+  images/                # Live application screenshots
   DEPLOYMENT.md
   LOOM_SCRIPT.md
 frontend/

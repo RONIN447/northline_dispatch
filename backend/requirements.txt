@@ -5,5 +5,3 @@ pydantic>=2.12,<3
 pyyaml
 anthropic
 openai
-google-genai
-python-dotenv
