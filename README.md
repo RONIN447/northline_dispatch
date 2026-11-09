@@ -9,11 +9,11 @@ Compare driving routes using forecast weather, truck load, and travel time. Revi
 <p>
   <a href="https://northline-frontend.onrender.com/"><strong>Launch the live application</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/RONIN447/northline_dispatch">Source code</a>
+  <a href="https://github.com/RONIN447/northline_dispatch_ops">Source code</a>
 </p>
 
 <p>
-  <a href="https://github.com/RONIN447/northline_dispatch/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch/ci.yml?branch=main&label=CI" alt="CI status"></a>
+  <a href="https://github.com/RONIN447/northline_dispatch_ops/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/RONIN447/northline_dispatch_ops/ci.yml?branch=master&label=CI" alt="CI status"></a>
   <a href="https://northline-frontend.onrender.com/"><img src="https://img.shields.io/badge/demo-live-155f50" alt="Live demo"></a>
   <img src="https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb" alt="React and Vite">
   <img src="https://img.shields.io/badge/backend-Django-092e20" alt="Django">
@@ -229,9 +229,8 @@ These results confirm the mock-backed test pipeline only.
 
 The gate was also exercised with an intentionally broken validator and
 `MOCK_MODE=faulty_number` on a temporary branch. CI failed as expected on the
-`numbers_grounded` threshold.
+`numbers_grounded` threshold: [GitHub Actions run #38](https://github.com/RONIN447/northline_dispatch_ops/actions/runs/40180426467).
 
-![GitHub Actions showing the intentional evaluation-gate failure](docs/images/eval-gate-failure.png)
 
 ### Briefing providers
 
@@ -241,9 +240,7 @@ It defaults to the deterministic mock provider:
 
 ```powershell
 $env:LLM_PROVIDER = "mock"
-$env:MOCK_MODE = "normal" # faulty_route, faulty_missing_checkpoint, faulty_number,
-                          # faulty_downgrade, faulty_no_gap, faulty_route_id,
-                          # faulty_place each exercise a specific check
+$env:MOCK_MODE = "normal"
 ```
 
 Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`,
@@ -261,7 +258,7 @@ these variables in PowerShell. Choose an active chat-completion model from your
 GroqCloud account.
 
 ```powershell
-Set-Location 'C:\path\to\northline_dispatch\backend'
+Set-Location 'C:\path\to\northline_dispatch_ops\backend'
 $env:LLM_PROVIDER = "groq"
 $secret = Read-Host "Groq API key" -AsSecureString
 $env:GROQ_API_KEY = (New-Object System.Net.NetworkCredential("", $secret)).Password
