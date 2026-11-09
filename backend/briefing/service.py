@@ -3,15 +3,13 @@
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from pydantic import ValidationError
 
 from briefing.prompt import PROMPT_VERSION, SYSTEM_PROMPT
 from briefing.providers import (
     AnthropicProvider,
-    GeminiProvider,
-    GroqProvider,
     MockProvider,
     OpenAIProvider,
     Provider,
@@ -59,19 +57,15 @@ class BriefingMetadata:
     output_tokens: int
     latency_ms: float
     retry_count: int
-    raw_output: str = ""
-    finish_reason: Optional[str] = None
 
 
 class BriefingGenerationError(ValueError):
     """Raised when the provider fails to return a schema-valid briefing."""
 
 
-def generate_briefing(
-    plan: Dict[str, Any], provider: Optional[Provider] = None
-) -> Tuple[Briefing, BriefingMetadata]:
+def generate_briefing(plan: Dict[str, Any]) -> Tuple[Briefing, BriefingMetadata]:
     """Generate a schema-validated briefing, retrying once for invalid output."""
-    provider = provider or get_provider()
+    provider = get_provider()
     trimmed_plan = _trim_plan(plan)
     user_prompt = _format_user_prompt(trimmed_plan)
     input_tokens = 0
@@ -109,8 +103,6 @@ def generate_briefing(
             output_tokens=output_tokens,
             latency_ms=latency_ms,
             retry_count=attempt,
-            raw_output=response.text,
-            finish_reason=response.finish_reason,
         )
         return briefing, metadata
 
@@ -170,10 +162,6 @@ def _provider_name(provider: Provider) -> str:
         return "anthropic"
     if isinstance(provider, OpenAIProvider):
         return "openai"
-    if isinstance(provider, GeminiProvider):
-        return "gemini"
-    if isinstance(provider, GroqProvider):
-        return "groq"
     return provider.__class__.__name__
 
 
