@@ -168,6 +168,19 @@ counts to `evals/reports/latest.md`. The report's final pass rates demonstrate
 the validator's behavior, not independent model quality; compare raw pass rates
 and correction rates when assessing model performance.
 
+Select a briefing prompt for one evaluation with `--prompt v1` or `--prompt v2`.
+Compare both against the same scenario set with:
+
+```powershell
+python -m django run_evals --compare v1 v2
+```
+
+The comparison is written to
+`evals/reports/compare_<model>_<UTC-date>.md`; the raw JSONL for each version
+is saved under `evals/reports/raw/`. Use `--output PATH` to override the report
+path. Comparison reports include raw pass rates per check, fallback and retry
+rates, latency percentiles, average tokens, and the functional targets.
+
 The CI quality gate requires 100% final pass rates for all seven configured
 checks in `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`;
 that verifies the evaluation pipeline and deterministic guardrails only, not
@@ -193,10 +206,24 @@ $env:MOCK_MODE = "normal" # faulty_route, faulty_missing_checkpoint, faulty_numb
                           # faulty_place each exercise a specific check
 ```
 
-Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`, or
-`LLM_PROVIDER=openai` with `OPENAI_API_KEY` and `OPENAI_MODEL`, to call a hosted
-model. SDK imports are lazy, and provider requests have a 20-second timeout
-inside a 45-second Gunicorn worker timeout.
+Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`,
+`LLM_PROVIDER=openai` with `OPENAI_API_KEY` and `OPENAI_MODEL`,
+`LLM_PROVIDER=groq` with `GROQ_API_KEY` and `GROQ_MODEL`, or
+`LLM_PROVIDER=gemini` with `GEMINI_API_KEY` and `GEMINI_MODEL` to call a hosted
+model. Groq uses its OpenAI-compatible chat-completions API. SDK imports are
+lazy, and provider requests have a 20-second timeout inside a 45-second
+Gunicorn worker timeout.
+
+For local Groq runs, set the API key and model in the environment. The optional
+`GROQ_MAX_TOKENS` setting defaults to `4096`; Groq `gpt-oss` requests use low
+reasoning effort.
+
+```powershell
+$env:LLM_PROVIDER = "groq"
+$env:GROQ_API_KEY = "<your Groq API key>"
+$env:GROQ_MODEL = "openai/gpt-oss-20b"
+$env:GROQ_MAX_TOKENS = "4096"
+```
 Production requires an explicit `LLM_PROVIDER`; leaving it unset disables briefing
 generation with a configuration response. Responses identify the selected provider
 and model in metadata, including `mock` / `rule-based` when the mock is selected. Set
@@ -209,10 +236,12 @@ delimits the plan as untrusted data. It validates the response against the
 `Briefing` schema and retries once with the parse/validation error if needed.
 Provider API failures raise a separate request error; output validation failure
 after retry raises a generation error. Hosted requests use temperature 0 and a
-1,200-token output cap. The service returns the validated briefing and provider,
-prompt, token, latency, and retry metadata. The system prompt is versioned as
-`v1`; behavioral safety checks are implemented separately from this generation
-step.
+1,200-token output cap, except Groq uses `GROQ_MAX_TOKENS` (default `4096`).
+Groq requests for `gpt-oss` models also set low reasoning effort. The service
+returns the validated briefing and provider, prompt, token, latency, and retry
+metadata. Prompt v2 is the default; set `PROMPT_VERSION=v1` to select v1.
+Both prompts include a schema generated from the Pydantic `Briefing` model;
+behavioral safety checks are implemented separately from generation.
 
 `briefing.validator.enforce(plan, briefing)` applies deterministic safety
 corrections and returns `(final_briefing, interventions, fallback_used)`.

@@ -2,9 +2,9 @@
 
 from typing import List, Optional
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from routing.risk_levels import RISK_LEVELS
+from routing.risk_levels import NO_TRAVEL, RISK_LEVELS, SEVERE
 
 
 class BriefingLocation(BaseModel):
@@ -63,9 +63,8 @@ class BriefingRoutePlan(BaseModel):
         return self
 
 
-class RiskyCheckpoint(BaseModel):
-    route_id: str
-    checkpoint_index: int
+class WorstCheckpoint(BaseModel):
+    index: int = Field(ge=0)
     level: str
 
     @field_validator("level")
@@ -76,9 +75,36 @@ class RiskyCheckpoint(BaseModel):
         return value
 
 
+class RiskRange(BaseModel):
+    start_mile: float
+    end_mile: float
+    level: str
+
+    @field_validator("level")
+    @classmethod
+    def validate_level(cls, value: str) -> str:
+        if value not in (SEVERE, NO_TRAVEL):
+            raise ValueError(f"Risk range level must be {SEVERE} or {NO_TRAVEL}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "RiskRange":
+        if self.end_mile < self.start_mile:
+            raise ValueError("end_mile must be greater than or equal to start_mile")
+        return self
+
+
+class RouteRiskSummary(BaseModel):
+    route_id: str
+    worst_checkpoint: WorstCheckpoint
+    severe_count: int = Field(ge=0)
+    no_travel_count: int = Field(ge=0)
+    risk_ranges: Optional[List[RiskRange]] = None
+
+
 class Briefing(BaseModel):
     recommended_route_id: str
     summary: str
-    risky_checkpoints: List[RiskyCheckpoint]
+    route_risks: List[RouteRiskSummary]
     data_gaps: List[str]
     dispatcher_actions: List[str]

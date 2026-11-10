@@ -5,6 +5,7 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from evals.checks import expected_route_risks
 from routing.risk_levels import RISK_LEVELS
 from routing.views import (
     parse_checkpoint_spacing,
@@ -69,6 +70,21 @@ def _make_scenario(
     if mutate is not None:
         mutate(plan)
     plan = _strip_geometry(_recompute_plan(plan, weight))
+    expected_gaps = []
+    risk_counts = Counter()
+    for route in plan["routes"]:
+        for index, checkpoint in enumerate(route["checkpoints"]):
+            risk = checkpoint["risk"]
+            risk_counts[risk] += 1
+            missing = [
+                field for field in WEATHER_FIELDS if checkpoint.get(field) is None
+            ]
+            if missing:
+                expected_gaps.append(
+                    "{} checkpoint {} is missing {}.".format(
+                        route["id"], index, ", ".join(missing)
+                    )
+                )
     return {
         "id": scenario_id,
         "category": category,
@@ -80,6 +96,15 @@ def _make_scenario(
             "departure": request["departure"],
         },
         "plan": plan,
+        "expect": {
+            "recommended_route_id": plan["recommendedRouteId"],
+            "risk_counts": {
+                level: risk_counts[level]
+                for level in RISK_LEVELS
+            },
+            "route_risks": expected_route_risks(plan),
+            "data_gaps": expected_gaps,
+        },
     }
 
 

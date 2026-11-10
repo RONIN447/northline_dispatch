@@ -421,5 +421,54 @@
     ],
     "recommendedRouteId": "route-2-routability",
     "forecastHours": 48
+  },
+  "expect": {
+    "recommended_route_id": "route-2-routability",
+    "risk_counts": {
+      "Low": 34,
+      "Moderate": 0,
+      "High": 0,
+      "Severe": 1,
+      "No Travel": 0
+    },
+    "route_risks": [
+      {
+        "route_id": "route-2-routability",
+        "worst_checkpoint": {
+          "index": 0,
+          "level": "Low"
+        },
+        "severe_count": 0,
+        "no_travel_count": 0
+      },
+      {
+        "route_id": "route-3-routability",
+        "worst_checkpoint": {
+          "index": 0,
+          "level": "Low"
+        },
+        "severe_count": 0,
+        "no_travel_count": 0
+      },
+      {
+        "route_id": "route-1-routability",
+        "worst_checkpoint": {
+          "index": 2,
+          "level": "Severe"
+        },
+        "severe_count": 1,
+        "no_travel_count": 0,
+        "risk_ranges": [
+          {
+            "start_mile": 50,
+            "end_mile": 50,
+            "level": "Severe"
+          }
+        ]
+      }
+    ],
+    "data_gaps": [
+      "route-1-routability checkpoint 2 is missing windMph."
+    ]
   }
 }

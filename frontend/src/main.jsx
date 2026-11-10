@@ -672,23 +672,40 @@ function BriefingPanel({ result, isLoading, errorMessage, onGenerate }) {
       {briefing ? (
         <div className="briefing-content">
           <p className="briefing-summary">{briefing.summary}</p>
-          {briefing.risky_checkpoints.length > 0 && (
+          {briefing.route_risks.length > 0 && (
             <div className="briefing-section">
-              <b>Risky checkpoints</b>
-              <ul className="briefing-risk-list">
-                {briefing.risky_checkpoints.map((checkpoint) => (
-                  <li key={`${checkpoint.route_id}-${checkpoint.checkpoint_index}`}>
-                    <span>{checkpoint.route_id} · checkpoint {checkpoint.checkpoint_index}</span>
-                    <span
-                      className="briefing-risk"
-                      style={{
-                        color: RISK_COLORS[checkpoint.level],
-                        backgroundColor: `${RISK_COLORS[checkpoint.level]}18`,
-                        borderColor: `${RISK_COLORS[checkpoint.level]}55`,
-                      }}
-                    >
-                      {checkpoint.level}
-                    </span>
+              <b>Route risk summary</b>
+              <ul className="briefing-route-risk-list">
+                {briefing.route_risks.map((routeRisk) => (
+                  <li key={routeRisk.route_id}>
+                    <div className="briefing-route-risk-heading">
+                      <strong>{routeRisk.route_id}</strong>
+                      <span>
+                        Worst: checkpoint {routeRisk.worst_checkpoint.index}
+                        <span
+                          className="briefing-risk"
+                          style={{
+                            color: RISK_COLORS[routeRisk.worst_checkpoint.level],
+                            backgroundColor: `${RISK_COLORS[routeRisk.worst_checkpoint.level]}18`,
+                            borderColor: `${RISK_COLORS[routeRisk.worst_checkpoint.level]}55`,
+                          }}
+                        >
+                          {routeRisk.worst_checkpoint.level}
+                        </span>
+                      </span>
+                    </div>
+                    <small>
+                      Severe: {routeRisk.severe_count} · No Travel: {routeRisk.no_travel_count}
+                    </small>
+                    {routeRisk.risk_ranges?.length > 0 && (
+                      <small>
+                        Risk ranges: {routeRisk.risk_ranges.map((riskRange) => (
+                          `${riskRange.level} ${riskRange.start_mile === riskRange.end_mile
+                            ? `${riskRange.start_mile} mi`
+                            : `${riskRange.start_mile}-${riskRange.end_mile} mi`}`
+                        )).join(', ')}
+                      </small>
+                    )}
                   </li>
                 ))}
               </ul>

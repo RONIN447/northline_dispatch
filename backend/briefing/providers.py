@@ -7,9 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
-from routing.risk_levels import HIGH, NO_TRAVEL, RISK_LEVELS, RISK_SCORES, SEVERE
+from routing.risk_levels import HIGH, RISK_SCORES
 
-from briefing.schema import Briefing, RiskyCheckpoint
+from briefing.schema import Briefing, RouteRiskSummary
+from evals.checks import expected_route_risks
 
 PROVIDER_TIMEOUT_SECONDS = 20.0
 GUNICORN_TIMEOUT_SECONDS = 45
@@ -22,6 +23,7 @@ class ProviderResponse:
     latency_ms: float
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
 
 
 class ProviderRequestError(RuntimeError):
@@ -44,19 +46,21 @@ class MockProvider:
             "normal",
             "faulty",
             "faulty_route",
-            "faulty_missing_checkpoint",
+            "faulty_risk_range",
             "faulty_number",
-            "faulty_downgrade",
+            "faulty_worst_checkpoint",
+            "faulty_risk_count",
             "faulty_no_gap",
-            "faulty_safe",
-            "faulty_route_id",
             "faulty_place",
+            "faulty_route_id",
+            "faulty_safe",
         }:
             raise ValueError(
                 "MOCK_MODE must be 'normal', 'faulty', 'faulty_route', "
-                "'faulty_missing_checkpoint', 'faulty_number', "
-                "'faulty_downgrade', 'faulty_no_gap', 'faulty_safe', "
-                "'faulty_route_id', or 'faulty_place'."
+                "'faulty_risk_range', 'faulty_number', "
+                "'faulty_worst_checkpoint', 'faulty_risk_count', "
+                "'faulty_no_gap', 'faulty_place', 'faulty_route_id', "
+                "or 'faulty_safe'."
             )
 
     def generate(self, system: str, user: str) -> ProviderResponse:
@@ -74,20 +78,22 @@ class MockProvider:
         briefing = self._build_briefing(route_plan)
         if self.mode in {"faulty", "faulty_route"}:
             self._make_faulty_route(briefing, route_plan)
-        if self.mode in {"faulty", "faulty_missing_checkpoint"}:
-            self._make_faulty_missing_checkpoint(briefing)
+        if self.mode in {"faulty", "faulty_risk_range"}:
+            self._make_faulty_risk_range(briefing)
         if self.mode in {"faulty", "faulty_number"}:
             self._make_faulty_number(briefing)
-        if self.mode == "faulty_downgrade":
-            briefing = self._make_faulty_downgrade(briefing)
+        if self.mode == "faulty_worst_checkpoint":
+            self._make_faulty_worst_checkpoint(briefing)
+        elif self.mode == "faulty_risk_count":
+            self._make_faulty_risk_count(briefing)
         elif self.mode == "faulty_no_gap":
             briefing.data_gaps = []
-        elif self.mode == "faulty_safe":
-            briefing.dispatcher_actions.append("This route is safe to travel.")
-        elif self.mode == "faulty_route_id":
-            briefing.dispatcher_actions.append("Route route-999 is faster.")
         elif self.mode == "faulty_place":
             briefing.dispatcher_actions.append("Reroute through Phoenix.")
+        elif self.mode == "faulty_route_id":
+            briefing.dispatcher_actions.append("Route route-999 is faster.")
+        elif self.mode == "faulty_safe":
+            briefing.dispatcher_actions.append("This route is safe to travel.")
         text = briefing.model_dump_json()
         return ProviderResponse(
             text=text,
@@ -95,6 +101,7 @@ class MockProvider:
             latency_ms=(time.perf_counter() - started) * 1000,
             input_tokens=len(system.split()) + len(user.split()),
             output_tokens=len(text.split()),
+            finish_reason="stop",
         )
 
     @staticmethod
@@ -107,21 +114,16 @@ class MockProvider:
         if recommended_route is None:
             raise ValueError("Route plan has no route matching recommendedRouteId.")
 
-        risky_checkpoints = []
+        route_risks = [
+            RouteRiskSummary.model_validate(item)
+            for item in expected_route_risks(route_plan)
+        ]
         data_gaps = []
         for route in routes:
             for index, checkpoint in enumerate(route["checkpoints"]):
                 risk = checkpoint.get("risk")
                 if risk not in RISK_SCORES:
                     raise ValueError("Route plan contains an unknown checkpoint risk.")
-                if RISK_SCORES[risk] >= RISK_SCORES[HIGH]:
-                    risky_checkpoints.append(
-                        RiskyCheckpoint(
-                            route_id=route["id"],
-                            checkpoint_index=index,
-                            level=risk,
-                        )
-                    )
                 missing = [
                     field
                     for field in ("windMph", "rainInHr", "snowInHr")
@@ -145,13 +147,18 @@ class MockProvider:
             recommended_route["highMiles"],
             recommended_route["noTravelMiles"],
         )
-        recommended_risks = [item.level for item in risky_checkpoints
-                             if item.route_id == recommended_route_id]
-        if NO_TRAVEL in recommended_risks:
+        recommended_risks = next(
+            item for item in route_risks if item.route_id == recommended_route_id
+        )
+        recommended_route_has_high_risk = any(
+            RISK_SCORES[checkpoint["risk"]] >= RISK_SCORES[HIGH]
+            for checkpoint in recommended_route["checkpoints"]
+        )
+        if recommended_risks.no_travel_count:
             actions = ["Hold dispatch until No Travel checkpoints have been reviewed."]
-        elif SEVERE in recommended_risks:
+        elif recommended_risks.severe_count:
             actions = ["Review Severe checkpoints and consider delaying or rerouting."]
-        elif recommended_risks:
+        elif recommended_route_has_high_risk:
             actions = ["Brief the driver on elevated-risk checkpoints and monitor conditions."]
         else:
             actions = ["Proceed with the recommended route and monitor checkpoint forecasts."]
@@ -159,7 +166,7 @@ class MockProvider:
         return Briefing(
             recommended_route_id=recommended_route_id,
             summary=summary,
-            risky_checkpoints=risky_checkpoints,
+            route_risks=route_risks,
             data_gaps=data_gaps,
             dispatcher_actions=actions,
         )
@@ -174,28 +181,33 @@ class MockProvider:
         briefing.recommended_route_id = wrong_route
 
     @staticmethod
-    def _make_faulty_missing_checkpoint(briefing: Briefing) -> None:
-        target_risk = SEVERE
-        if not any(item.level == SEVERE for item in briefing.risky_checkpoints):
-            target_risk = NO_TRAVEL
-        briefing.risky_checkpoints = [
-            item for item in briefing.risky_checkpoints if item.level != target_risk
-        ]
+    def _make_faulty_risk_range(briefing: Briefing) -> None:
+        summary = next(
+            (item for item in briefing.route_risks if item.risk_ranges),
+            None,
+        )
+        if summary is None:
+            raise ValueError(
+                "MOCK_MODE=faulty_risk_range requires a route with Severe or No Travel checkpoints."
+            )
+        summary.risk_ranges = []
 
     @staticmethod
     def _make_faulty_number(briefing: Briefing) -> None:
         briefing.summary += " Estimated delay: 999 hours."
 
     @staticmethod
-    def _make_faulty_downgrade(briefing: Briefing) -> Briefing:
-        for checkpoint in briefing.risky_checkpoints:
-            risk_index = RISK_LEVELS.index(checkpoint.level)
-            if risk_index > 0:
-                checkpoint.level = RISK_LEVELS[risk_index - 1]
-                return briefing
-        raise ValueError(
-            "MOCK_MODE=faulty_downgrade requires a route plan with a risky checkpoint."
-        )
+    def _make_faulty_worst_checkpoint(briefing: Briefing) -> None:
+        if not briefing.route_risks:
+            raise ValueError("MOCK_MODE=faulty_worst_checkpoint requires a route.")
+        worst = briefing.route_risks[0].worst_checkpoint
+        worst.level = "Moderate" if worst.level == "Low" else "Low"
+
+    @staticmethod
+    def _make_faulty_risk_count(briefing: Briefing) -> None:
+        if not briefing.route_risks:
+            raise ValueError("MOCK_MODE=faulty_risk_count requires a route.")
+        briefing.route_risks[0].severe_count += 1
 
 
 class AnthropicProvider:
@@ -240,6 +252,7 @@ class AnthropicProvider:
             (time.perf_counter() - started) * 1000,
             input_tokens,
             output_tokens,
+            _normalize_finish_reason(getattr(response, "stop_reason", None)),
         )
 
 
@@ -286,7 +299,187 @@ class OpenAIProvider:
             (time.perf_counter() - started) * 1000,
             input_tokens,
             output_tokens,
+            _normalize_finish_reason(
+                getattr(response.choices[0], "finish_reason", None)
+            ),
         )
+
+
+class GroqProvider:
+    MIN_REQUEST_INTERVAL_SECONDS = 2.1
+    MAX_RATE_LIMIT_RETRIES = 3
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        api_key = api_key or os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is required for the Groq provider.")
+        self._model = model or os.getenv("GROQ_MODEL")
+        if not self._model:
+            raise ValueError("GROQ_MODEL is required for the Groq provider.")
+        try:
+            self._max_tokens = int(os.getenv("GROQ_MAX_TOKENS", "4096"))
+        except ValueError as error:
+            raise ValueError("GROQ_MAX_TOKENS must be a positive integer.") from error
+        if self._max_tokens < 1:
+            raise ValueError("GROQ_MAX_TOKENS must be a positive integer.")
+        self._api_key = api_key
+        self._last_request_at = None
+        try:
+            from openai import APIError, OpenAI
+        except ImportError as error:
+            raise RuntimeError("Install the openai package to use the Groq provider.") from error
+        self._api_error_type = APIError
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            timeout=PROVIDER_TIMEOUT_SECONDS,
+            max_retries=0,
+        )
+
+    def generate(self, system: str, user: str) -> ProviderResponse:
+        started = time.perf_counter()
+        for attempt in range(self.MAX_RATE_LIMIT_RETRIES + 1):
+            if self._last_request_at is not None:
+                elapsed = time.monotonic() - self._last_request_at
+                if elapsed < self.MIN_REQUEST_INTERVAL_SECONDS:
+                    time.sleep(self.MIN_REQUEST_INTERVAL_SECONDS - elapsed)
+            self._last_request_at = time.monotonic()
+            try:
+                request_options = {
+                    "model": self._model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                    "max_tokens": self._max_tokens,
+                }
+                if "gpt-oss" in self._model.lower():
+                    request_options["reasoning_effort"] = "low"
+                response = self._client.chat.completions.create(**request_options)
+                break
+            except self._api_error_type as error:
+                status_code = getattr(error, "status_code", None)
+                if (
+                    status_code == 429
+                    and attempt < self.MAX_RATE_LIMIT_RETRIES
+                ):
+                    time.sleep(self._rate_limit_retry_delay(error, attempt))
+                    continue
+                body = getattr(error, "body", None)
+                details = body.get("error", {}) if isinstance(body, dict) else {}
+                message = details.get("message") if isinstance(details, dict) else None
+                code = details.get("code") if isinstance(details, dict) else None
+                safe_message = str(message or "").replace(
+                    self._api_key, "[REDACTED]"
+                )[:300]
+                error_details = ", ".join(
+                    item
+                    for item in (str(code) if code else "", safe_message)
+                    if item
+                )
+                raise ProviderRequestError(
+                    "Groq briefing request failed ({}{}).".format(
+                        "HTTP {}".format(status_code)
+                        if status_code is not None
+                        else "connection error",
+                        ", " + error_details if error_details else "",
+                    )
+                ) from error
+
+        text = response.choices[0].message.content or ""
+        input_tokens = response.usage.prompt_tokens if response.usage else 0
+        output_tokens = response.usage.completion_tokens if response.usage else 0
+        return ProviderResponse(
+            text,
+            input_tokens + output_tokens,
+            (time.perf_counter() - started) * 1000,
+            input_tokens,
+            output_tokens,
+            _normalize_finish_reason(
+                getattr(response.choices[0], "finish_reason", None)
+            ),
+        )
+
+    @staticmethod
+    def _rate_limit_retry_delay(error, attempt):
+        response = getattr(error, "response", None)
+        headers = response.headers if response is not None else {}
+        for header in ("retry-after", "x-ratelimit-reset-requests"):
+            value = headers.get(header)
+            if value:
+                normalized = value[:-1] if value.endswith("s") else value
+                try:
+                    return max(float(normalized), 0.0)
+                except ValueError:
+                    pass
+        return float(2 ** (attempt + 1))
+
+
+class GeminiProvider:
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is required for the Gemini provider.")
+        self._model = model or os.getenv("GEMINI_MODEL")
+        if not self._model:
+            raise ValueError("GEMINI_MODEL is required for the Gemini provider.")
+        try:
+            from google import genai
+            from google.genai import errors, types
+        except ImportError as error:
+            raise RuntimeError("Install the google-genai package to use Gemini.") from error
+        self._api_error_type = errors.APIError
+        self._types = types
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=int(PROVIDER_TIMEOUT_SECONDS * 1000)
+            ),
+        )
+
+    def generate(self, system: str, user: str) -> ProviderResponse:
+        started = time.perf_counter()
+        try:
+            response = self._client.models.generate_content(
+                model=self._model,
+                contents=user,
+                config=self._types.GenerateContentConfig(
+                    system_instruction=system,
+                    response_mime_type="application/json",
+                    temperature=0,
+                    max_output_tokens=1200,
+                ),
+            )
+        except self._api_error_type as error:
+            raise ProviderRequestError(
+                "Gemini briefing request failed (HTTP {}, {}).".format(
+                    error.code, error.status
+                )
+            ) from error
+        text = response.text or ""
+        usage = response.usage_metadata
+        input_tokens = getattr(usage, "prompt_token_count", 0) or 0
+        output_tokens = getattr(usage, "candidates_token_count", 0) or 0
+        return ProviderResponse(
+            text,
+            input_tokens + output_tokens,
+            (time.perf_counter() - started) * 1000,
+            input_tokens,
+            output_tokens,
+            _normalize_finish_reason(
+                getattr(response.candidates[0], "finish_reason", None)
+                if getattr(response, "candidates", None)
+                else None
+            ),
+        )
+
+
+def _normalize_finish_reason(reason):
+    if reason is None:
+        return None
+    return str(getattr(reason, "name", reason))
 
 
 def get_provider(name: Optional[str] = None) -> Provider:
@@ -305,4 +498,10 @@ def get_provider(name: Optional[str] = None) -> Provider:
         return AnthropicProvider()
     if provider_name == "openai":
         return OpenAIProvider()
-    raise ValueError("LLM_PROVIDER must be 'mock', 'anthropic', or 'openai'.")
+    if provider_name == "groq":
+        return GroqProvider()
+    if provider_name == "gemini":
+        return GeminiProvider()
+    raise ValueError(
+        "LLM_PROVIDER must be 'mock', 'anthropic', 'openai', 'groq', or 'gemini'."
+    )

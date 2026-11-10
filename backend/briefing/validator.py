@@ -1,16 +1,15 @@
 """Deterministic guardrails for generated dispatch briefings."""
 
 from dataclasses import dataclass
-from typing import List, Set, Tuple
+from typing import List, Tuple
 
-from briefing.schema import Briefing, RiskyCheckpoint
+from briefing.schema import Briefing, RouteRiskSummary
 from evals.checks import (
     evaluate_checks,
     expected_data_gaps,
-    expected_risky_checkpoints,
+    expected_route_risks,
     validate_briefing,
 )
-from routing.risk_levels import RISK_LEVELS
 
 
 @dataclass(frozen=True)
@@ -49,79 +48,86 @@ def enforce(plan: dict, briefing: Briefing) -> Tuple[Briefing, List[Intervention
         )
         final.data_gaps = canonical_gaps
 
-    expected_risks = expected_risky_checkpoints(plan)
-    plan_risks = {
-        (route_id, checkpoint_index): level
-        for route_id, checkpoint_index, level in expected_risks
-    }
-    seen: Set[Tuple[str, int]] = set()
-    corrected_risks = []
-    for checkpoint in final.risky_checkpoints:
-        key = (checkpoint.route_id, checkpoint.checkpoint_index)
-        plan_level = plan_risks.get(key)
-        if plan_level is None:
+    expected_risks = [
+        RouteRiskSummary.model_validate(item)
+        for item in expected_route_risks(plan)
+    ]
+    expected_by_route = {item.route_id: item for item in expected_risks}
+    actual_by_route = {}
+    for item in final.route_risks:
+        expected = expected_by_route.get(item.route_id)
+        if expected is None:
             interventions.append(
                 Intervention(
-                    rule="remove_unexpected_risky_checkpoint",
-                    detail="Removed {} checkpoint {} from the risky list.".format(*key),
-                )
-            )
-            continue
-        if key in seen:
-            interventions.append(
-                Intervention(
-                    rule="remove_duplicate_risky_checkpoint",
-                    detail="Removed duplicate {} checkpoint {}.".format(*key),
-                )
-            )
-            continue
-        seen.add(key)
-        if checkpoint.level != plan_level:
-            if RISK_LEVELS.index(checkpoint.level) < RISK_LEVELS.index(plan_level):
-                rule = "restore_downgraded_risk"
-                detail = "Restored {} checkpoint {} from {} to {}.".format(
-                    checkpoint.route_id,
-                    checkpoint.checkpoint_index,
-                    checkpoint.level,
-                    plan_level,
-                )
-            else:
-                rule = "match_engine_risk"
-                detail = "Changed {} checkpoint {} from {} to {}.".format(
-                    checkpoint.route_id,
-                    checkpoint.checkpoint_index,
-                    checkpoint.level,
-                    plan_level,
-                )
-            interventions.append(Intervention(rule=rule, detail=detail))
-        corrected_risks.append(
-            RiskyCheckpoint(
-                route_id=checkpoint.route_id,
-                checkpoint_index=checkpoint.checkpoint_index,
-                level=plan_level,
-            )
-        )
-
-    for route_id, checkpoint_index, level in expected_risks:
-        key = (route_id, checkpoint_index)
-        if key not in seen:
-            corrected_risks.append(
-                RiskyCheckpoint(
-                    route_id=route_id,
-                    checkpoint_index=checkpoint_index,
-                    level=level,
-                )
-            )
-            seen.add(key)
-            interventions.append(
-                Intervention(
-                    rule="add_required_risky_checkpoint",
-                    detail="Added {} checkpoint {} at {} risk.".format(
-                        route_id, checkpoint_index, level
+                    rule="remove_unexpected_route_risk",
+                    detail="Removed a risk summary for unknown route {}.".format(
+                        item.route_id
                     ),
                 )
             )
-    final.risky_checkpoints = corrected_risks
+            continue
+        if item.route_id in actual_by_route:
+            interventions.append(
+                Intervention(
+                    rule="remove_duplicate_route_risk",
+                    detail="Removed duplicate risk summary for route {}.".format(
+                        item.route_id
+                    ),
+                )
+            )
+            continue
+        actual_by_route[item.route_id] = item
+        if item.worst_checkpoint != expected.worst_checkpoint:
+            interventions.append(
+                Intervention(
+                    rule="restore_worst_checkpoint",
+                    detail="Restored the engine's worst checkpoint for route {}.".format(
+                        item.route_id
+                    ),
+                )
+            )
+        if (
+            item.severe_count != expected.severe_count
+            or item.no_travel_count != expected.no_travel_count
+        ):
+            interventions.append(
+                Intervention(
+                    rule="restore_risk_counts",
+                    detail="Replaced Severe and No Travel counts for route {} with plan counts.".format(
+                        item.route_id
+                    ),
+                )
+            )
+        if item.risk_ranges != expected.risk_ranges:
+            interventions.append(
+                Intervention(
+                    rule="restore_risk_ranges",
+                    detail="Replaced risk ranges for route {} with plan-derived ranges.".format(
+                        item.route_id
+                    ),
+                )
+            )
+
+    for item in expected_risks:
+        if item.route_id not in actual_by_route:
+            interventions.append(
+                Intervention(
+                    rule="add_route_risk",
+                    detail="Added the plan-derived risk summary for route {}.".format(
+                        item.route_id
+                    ),
+                )
+            )
+    if [item.route_id for item in final.route_risks if item.route_id in expected_by_route] != [
+        item.route_id for item in expected_risks if item.route_id in actual_by_route
+    ]:
+        interventions.append(
+            Intervention(
+                rule="order_route_risks",
+                detail="Ordered route risk summaries to match the route plan.",
+            )
+        )
+    final.route_risks = expected_risks
 
     grounding_errors = validate_briefing(final, plan)
     if any(
@@ -162,13 +168,9 @@ def _template_briefing(plan: dict) -> Briefing:
     route = next(
         route for route in plan["routes"] if route["id"] == recommended_route_id
     )
-    risky_checkpoints = [
-        RiskyCheckpoint(
-            route_id=route_id,
-            checkpoint_index=checkpoint_index,
-            level=level,
-        )
-        for route_id, checkpoint_index, level in expected_risky_checkpoints(plan)
+    route_risks = [
+        RouteRiskSummary.model_validate(item)
+        for item in expected_route_risks(plan)
     ]
     data_gaps = expected_data_gaps(plan)
     actions = ["Review checkpoint conditions before dispatch."]
@@ -187,7 +189,7 @@ def _template_briefing(plan: dict) -> Briefing:
             route["highMiles"],
             route["noTravelMiles"],
         ),
-        risky_checkpoints=risky_checkpoints,
+        route_risks=route_risks,
         data_gaps=data_gaps,
         dispatcher_actions=actions,
     )
