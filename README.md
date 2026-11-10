@@ -181,11 +181,23 @@ is saved under `evals/reports/raw/`. Use `--output PATH` to override the report
 path. Comparison reports include raw pass rates per check, fallback and retry
 rates, latency percentiles, average tokens, and the functional targets.
 
-The CI quality gate requires 100% final pass rates for all seven configured
-checks in `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`;
+The CI quality gate requires 100% final pass rates for every check in the
+`final` section of `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`;
 that verifies the evaluation pipeline and deterministic guardrails only, not
-the quality of a real model's raw output. Run `python -m django run_evals`
-without `--gate` to generate a report locally without enforcing thresholds.
+the quality of a real model's raw output. Reports identify their evaluation
+mode and provider in the header.
+
+Run the separate, manual raw-model gate with a hosted provider, for example:
+
+```powershell
+$env:LLM_PROVIDER = "groq"
+python -m django run_evals --gate-raw
+```
+
+`--gate-raw` refuses to run with the mock provider. It evaluates unmodified
+model-output pass rates and fallback rate against the `raw_model` section of
+`evals/thresholds.yaml`; it is not part of CI. Run `python -m django run_evals`
+without either gate option to generate a report without enforcing thresholds.
 
 The gate was verified with an intentionally broken validator and
 `MOCK_MODE=faulty_number` on a temporary branch. The run failed as expected on

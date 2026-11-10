@@ -22,7 +22,10 @@ from evals.runner import (
     CHECK_NAMES,
     load_thresholds,
     quality_gate_failures,
+    raw_model_gate_failures,
     render_comparison_report,
+    render_raw_model_gate,
+    render_report,
     run_evaluations,
     write_failure_analysis,
     write_raw_results,
@@ -66,6 +69,7 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertIn("Average tokens", report)
         self.assertIn("Final pass rate", report)
         self.assertIn("Provider: mock", report)
+        self.assertIn("Mode: report", report)
         self.assertIn("Model: rule-based", report)
         self.assertIn("Prompt version: v1", report)
         self.assertIn("Pass rates by scenario category", report)
@@ -292,6 +296,8 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertIn("| Raw: numbers_grounded | 1/1 (100.0%) |", report)
         self.assertIn("| Raw: no_risk_downgrade (derived) | 1/1 (100.0%) |", report)
         self.assertIn("fallback under 20%", report)
+        self.assertIn("- Mode: prompt comparison", report)
+        self.assertIn("- Provider: mock", report)
         self.assertIn("raw/run-v1.jsonl", report)
 
     def test_comparison_report_requires_same_scenario_set(self):
@@ -312,10 +318,19 @@ class EvaluationRunnerTests(unittest.TestCase):
                 {"v1": [result], "v2": [dict(result, id="scenario-2")]}
             )
 
-    def test_configured_thresholds_are_all_safety_checks_at_100_percent(self):
+    def test_final_thresholds_are_all_checks_at_100_percent(self):
         thresholds = load_thresholds()
         self.assertEqual(set(thresholds), set(CHECK_NAMES))
         self.assertTrue(all(value == 1.0 for value in thresholds.values()))
+
+    def test_raw_model_thresholds_include_minimum_rates_and_fallback_cap(self):
+        thresholds = load_thresholds(section="raw_model")
+        self.assertEqual(
+            thresholds["minimum_pass_rates"]["route_matches_engine"], 1.0
+        )
+        self.assertEqual(thresholds["minimum_pass_rates"]["no_risk_downgrade"], 1.0)
+        self.assertEqual(thresholds["minimum_pass_rates"]["numbers_grounded"], 0.91)
+        self.assertEqual(thresholds["maximum_fallback_rate"], 0.2)
 
     def test_quality_gate_reports_threshold_misses(self):
         checks = {name: True for name in CHECK_NAMES}
@@ -328,6 +343,57 @@ class EvaluationRunnerTests(unittest.TestCase):
             failures,
             ["no_false_safe: final pass rate 0.0% is below required 100.0%"],
         )
+
+    def test_raw_model_gate_checks_risk_downgrade_and_fallback_rate(self):
+        checks = {name: True for name in CHECK_NAMES}
+        passed = {
+            "raw_checks": checks,
+            "fallback_used": False,
+        }
+        failed_risk = {
+            "raw_checks": dict(checks, risk_ranges_cover_checkpoints=False),
+            "fallback_used": True,
+        }
+        thresholds = {
+            "minimum_pass_rates": {
+                "route_matches_engine": 1.0,
+                "no_risk_downgrade": 1.0,
+                "numbers_grounded": 0.9,
+            },
+            "maximum_fallback_rate": 0.5,
+        }
+        failures = raw_model_gate_failures([passed, failed_risk], thresholds)
+        self.assertEqual(
+            failures,
+            [
+                "no_risk_downgrade: raw pass rate 50.0% is below required 100.0%",
+                "fallback rate 50.0% must be below maximum 50.0%",
+            ],
+        )
+        report = render_raw_model_gate([passed, failed_risk], thresholds)
+        self.assertIn("| no_risk_downgrade | 50.0% (1/2) | 100.0% | FAIL |", report)
+        self.assertIn("| fallback_rate | 50.0% (1/2) | < 50.0% | FAIL |", report)
+
+    def test_report_header_identifies_mode_and_provider(self):
+        result = {
+            "id": "test-scenario",
+            "provider": "mock",
+            "model": "rule-based",
+            "prompt_version": "v2",
+            "raw_checks": {name: True for name in CHECK_NAMES},
+            "final_checks": {name: True for name in CHECK_NAMES},
+            "retry_count": 0,
+            "latency_ms": 1,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "interventions": [],
+            "fallback_used": False,
+            "category": "severe_or_no_travel",
+        }
+        report = render_report([result], {}, 0, "test-run", mode="final-output gate")
+        self.assertIn("- Mode: final-output gate", report)
+        self.assertIn("- Provider: mock", report)
 
     def test_management_command_exits_with_error_when_gate_fails(self):
         report_results = [
@@ -352,6 +418,50 @@ class EvaluationRunnerTests(unittest.TestCase):
         ), patch("briefing.management.commands.run_evals.write_report"):
             with self.assertRaises(CommandError):
                 call_command("run_evals", "--gate", stdout=StringIO())
+
+    def test_management_command_rejects_mock_provider_for_raw_gate(self):
+        with patch(
+            "briefing.management.commands.run_evals.get_provider",
+            return_value=MockProvider(),
+        ), patch(
+            "briefing.management.commands.run_evals.run_evaluations"
+        ) as run_evaluations:
+            with self.assertRaisesRegex(CommandError, "requires a hosted model provider"):
+                call_command("run_evals", "--gate-raw", "--limit", "1")
+        run_evaluations.assert_not_called()
+
+    def test_management_command_runs_raw_gate_with_hosted_provider(self):
+        results = [
+            {
+                "provider": "groq",
+                "model": "gpt-oss-20b",
+                "prompt_version": "v2",
+                "raw_checks": {name: True for name in CHECK_NAMES},
+                "final_checks": {name: True for name in CHECK_NAMES},
+                "retry_count": 0,
+                "latency_ms": 1,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "interventions": [],
+                "fallback_used": False,
+                "category": "severe_or_no_travel",
+            }
+        ]
+        with patch(
+            "briefing.management.commands.run_evals.get_provider",
+            return_value=object(),
+        ), patch(
+            "briefing.management.commands.run_evals.run_evaluations",
+            return_value=("# report", results),
+        ), patch(
+            "briefing.management.commands.run_evals.render_report",
+            return_value="# report\n",
+        ) as render_report, patch(
+            "briefing.management.commands.run_evals.write_report"
+        ):
+            call_command("run_evals", "--gate-raw", "--limit", "1", stdout=StringIO())
+        self.assertEqual(render_report.call_args.kwargs["mode"], "raw-model gate")
 
     def test_management_command_filters_by_category_and_limit(self):
         report_results = [

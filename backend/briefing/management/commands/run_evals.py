@@ -9,7 +9,7 @@ import re
 from django.core.management.base import BaseCommand, CommandError
 
 from briefing.prompt import PROMPT_VERSION, get_system_prompt
-from briefing.providers import get_provider
+from briefing.providers import MockProvider, get_provider
 from briefing.service import generate_briefing
 from evals.runner import (
     CATEGORY_LABELS,
@@ -19,7 +19,9 @@ from evals.runner import (
     quality_gate_failures,
     render_report,
     render_comparison_report,
+    raw_model_gate_failures,
     render_quality_gate,
+    render_raw_model_gate,
     run_evaluations,
     write_failure_analysis,
     write_report,
@@ -31,10 +33,16 @@ class Command(BaseCommand):
     help = "Evaluate raw and validator-corrected briefings on the golden scenarios."
 
     def add_arguments(self, parser):
-        parser.add_argument(
+        gate_group = parser.add_mutually_exclusive_group()
+        gate_group.add_argument(
             "--gate",
             action="store_true",
-            help="Exit with an error if final pass rates miss configured thresholds.",
+            help="Exit with an error if final-output pass rates miss configured thresholds.",
+        )
+        gate_group.add_argument(
+            "--gate-raw",
+            action="store_true",
+            help="Manually gate raw model output; refuses to run with the mock provider.",
         )
         parser.add_argument(
             "--output",
@@ -70,9 +78,13 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         try:
             if options["compare"]:
-                if options["gate"] or options["failure_analysis"]:
+                if (
+                    options["gate"]
+                    or options["gate_raw"]
+                    or options["failure_analysis"]
+                ):
                     raise ValueError(
-                        "--gate and --failure-analysis cannot be combined with --compare."
+                        "Gate options and --failure-analysis cannot be combined with --compare."
                     )
                 if set(options["compare"]) != {"v1", "v2"}:
                     raise ValueError("--compare must specify v1 and v2 once each.")
@@ -98,6 +110,11 @@ class Command(BaseCommand):
             run_id = create_run_id()
             raw_path = RAW_REPORT_DIR / "{}.jsonl".format(run_id)
             provider = get_provider()
+            if options["gate_raw"] and isinstance(provider, MockProvider):
+                raise ValueError(
+                    "--gate-raw requires a hosted model provider; mock output "
+                    "cannot be used for the raw-model gate."
+                )
             results = []
             for batch in _scenario_batches(scenarios, 4):
                 _, batch_results = run_evaluations(
@@ -114,11 +131,22 @@ class Command(BaseCommand):
                 rule for result in results for rule in result["interventions"]
             )
             fallback_count = sum(result["fallback_used"] for result in results)
-            report = render_report(
-                results, intervention_counts, fallback_count, run_id
+            mode = (
+                "raw-model gate"
+                if options["gate_raw"]
+                else "final-output gate"
+                if options["gate"]
+                else "report only"
             )
-            failures = quality_gate_failures(results)
-            report += render_quality_gate(results)
+            report = render_report(
+                results, intervention_counts, fallback_count, run_id, mode=mode
+            )
+            if options["gate_raw"]:
+                failures = raw_model_gate_failures(results)
+                report += render_raw_model_gate(results)
+            else:
+                failures = quality_gate_failures(results)
+                report += render_quality_gate(results)
             write_report(report, report_path)
             if options["failure_analysis"]:
                 write_failure_analysis(results, Path(options["failure_analysis"]))
@@ -154,8 +182,14 @@ class Command(BaseCommand):
             raise CommandError(
                 "Evaluation quality gate failed: {}".format("; ".join(failures))
             )
+        if options["gate_raw"] and failures:
+            raise CommandError(
+                "Raw-model evaluation gate failed: {}".format("; ".join(failures))
+            )
         if options["gate"]:
             self.stdout.write(self.style.SUCCESS("Evaluation quality gate passed."))
+        if options["gate_raw"]:
+            self.stdout.write(self.style.SUCCESS("Raw-model evaluation gate passed."))
 
     def _handle_comparison(self, options):
         scenarios = load_scenarios()

@@ -23,6 +23,11 @@ CHECK_NAMES = (
     "route_ids_grounded",
     "place_names_grounded",
 )
+NO_RISK_DOWNGRADE_CHECKS = (
+    "worst_checkpoint_matches_engine",
+    "risk_counts_match_plan",
+    "risk_ranges_cover_checkpoints",
+)
 FAILURE_REASONS = {
     "route_matches_engine": "The generated recommendation did not match the engine-selected route.",
     "worst_checkpoint_matches_engine": "The reported worst checkpoint did not match the engine.",
@@ -150,7 +155,9 @@ def _offending_tokens_for_check(check, offending_tokens, briefing, route_plan):
     return tokens
 
 
-def render_report(results, intervention_counts, fallback_count, run_id=None):
+def render_report(
+    results, intervention_counts, fallback_count, run_id=None, mode="report"
+):
     """Render aggregate raw/final pass rates and correction counts as Markdown."""
     total = len(results)
     providers = sorted({result["provider"] for result in results})
@@ -160,6 +167,7 @@ def render_report(results, intervention_counts, fallback_count, run_id=None):
         "# Briefing evaluation report",
         "",
         "- Date (UTC): {}".format(datetime.now(timezone.utc).date().isoformat()),
+        "- Mode: {}".format(mode),
         "- Provider: {}".format(", ".join(providers) or "unknown"),
         "- Model: {}".format(", ".join(models) or "unknown"),
         "- Prompt version: {}".format(", ".join(prompt_versions) or "unknown"),
@@ -310,6 +318,7 @@ def render_comparison_report(results_by_version, run_ids=None):
         "# Prompt comparison evaluation",
         "",
         "- Date (UTC): {}".format(datetime.now(timezone.utc).date().isoformat()),
+        "- Mode: prompt comparison",
         "- Provider: {}".format(", ".join(providers) or "unknown"),
         "- Model: {}".format(", ".join(models) or "unknown"),
         "- Scenarios per version: {}".format(total),
@@ -357,15 +366,7 @@ def render_comparison_report(results_by_version, run_ids=None):
             values["Raw: {}".format(check)] = "{}/{} ({:.1f}%)".format(
                 passed, total, _percentage(passed, total)
             )
-        risk_fields = (
-            "worst_checkpoint_matches_engine",
-            "risk_counts_match_plan",
-            "risk_ranges_cover_checkpoints",
-        )
-        no_risk_downgrade_passes = sum(
-            all(result["raw_checks"][check] for check in risk_fields)
-            for result in results
-        )
+        no_risk_downgrade_passes = _raw_no_risk_downgrade_passes(results)
         values["Raw: no_risk_downgrade (derived)"] = "{}/{} ({:.1f}%)".format(
             no_risk_downgrade_passes,
             total,
@@ -402,11 +403,7 @@ def render_comparison_report(results_by_version, run_ids=None):
                 total,
             ),
             "no_risk_downgrade": _percentage(
-                sum(
-                    all(result["raw_checks"][check] for check in risk_fields)
-                    for result in results
-                ),
-                total,
+                _raw_no_risk_downgrade_passes(results), total
             ),
             "numbers_grounded": _percentage(
                 sum(result["raw_checks"]["numbers_grounded"] for result in results),
@@ -526,39 +523,71 @@ def write_failure_analysis(results, path):
                 )
 
 
-def load_thresholds(path=THRESHOLDS_PATH):
-    """Load and validate configured minimum final-output pass rates."""
+def load_thresholds(path=THRESHOLDS_PATH, section="final"):
+    """Load and validate the final-output or raw-model gate thresholds."""
     import yaml
 
     with path.open(encoding="utf-8") as threshold_file:
         config = yaml.safe_load(threshold_file)
-    if not isinstance(config, dict) or not isinstance(
-        config.get("final_pass_rates"), dict
-    ):
-        raise ValueError("Thresholds must define a final_pass_rates mapping.")
-    thresholds = config["final_pass_rates"]
-    unknown = set(thresholds) - set(CHECK_NAMES)
+    if not isinstance(config, dict):
+        raise ValueError("Thresholds must define final and raw_model sections.")
+
+    final = config.get("final")
+    if not isinstance(final, dict):
+        raise ValueError("Thresholds must define a final mapping.")
+    _validate_pass_rates(final, set(CHECK_NAMES), "final")
+
+    raw_model = config.get("raw_model")
+    raw_pass_rates = (
+        raw_model.get("minimum_pass_rates") if isinstance(raw_model, dict) else None
+    )
+    if not isinstance(raw_pass_rates, dict):
+        raise ValueError("Thresholds must define raw_model.minimum_pass_rates.")
+    _validate_pass_rates(
+        raw_pass_rates,
+        set(CHECK_NAMES) | {"no_risk_downgrade"},
+        "raw_model.minimum_pass_rates",
+        required={"route_matches_engine", "no_risk_downgrade"},
+    )
+    maximum_fallback_rate = raw_model.get("maximum_fallback_rate")
+    _validate_rate(maximum_fallback_rate, "raw_model.maximum_fallback_rate")
+
+    if section == "final":
+        return final
+    if section == "raw_model":
+        return {
+            "minimum_pass_rates": raw_pass_rates,
+            "maximum_fallback_rate": maximum_fallback_rate,
+        }
+    raise ValueError("Threshold section must be 'final' or 'raw_model'.")
+
+
+def _validate_pass_rates(rates, allowed, label, required=None):
+    unknown = set(rates) - allowed
     if unknown:
-        raise ValueError("Unknown evaluation checks in thresholds: {}".format(
-            ", ".join(sorted(unknown))
-        ))
-    missing = set(CHECK_NAMES) - set(thresholds)
+        raise ValueError(
+            "Unknown {} checks: {}".format(label, ", ".join(sorted(unknown)))
+        )
+    missing = (required or allowed) - set(rates)
     if missing:
-        raise ValueError("Missing evaluation thresholds: {}".format(
-            ", ".join(sorted(missing))
-        ))
-    for check, threshold in thresholds.items():
-        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
-            raise ValueError("Threshold for {} must be a number.".format(check))
-        if not 0 <= threshold <= 1:
-            raise ValueError("Threshold for {} must be between 0 and 1.".format(check))
-    return thresholds
+        raise ValueError(
+            "Missing {} thresholds: {}".format(label, ", ".join(sorted(missing)))
+        )
+    for check, threshold in rates.items():
+        _validate_rate(threshold, "{}.{}".format(label, check))
+
+
+def _validate_rate(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Threshold for {} must be a number.".format(label))
+    if not 0 <= value <= 1:
+        raise ValueError("Threshold for {} must be between 0 and 1.".format(label))
 
 
 def quality_gate_failures(results, thresholds=None):
     """Return final pass-rate threshold violations for the requested checks."""
     if thresholds is None:
-        thresholds = load_thresholds()
+        thresholds = load_thresholds(section="final")
     total = len(results)
     failures = []
     for check, minimum in thresholds.items():
@@ -570,6 +599,44 @@ def quality_gate_failures(results, thresholds=None):
                     check, rate, minimum
                 )
             )
+    return failures
+
+
+def _raw_no_risk_downgrade_passes(results):
+    return sum(
+        all(result["raw_checks"][check] for check in NO_RISK_DOWNGRADE_CHECKS)
+        for result in results
+    )
+
+
+def raw_model_gate_failures(results, thresholds=None):
+    """Return raw-output and fallback-rate threshold violations."""
+    if thresholds is None:
+        thresholds = load_thresholds(section="raw_model")
+    minimum_rates = thresholds["minimum_pass_rates"]
+    total = len(results)
+    failures = []
+    for check, minimum in minimum_rates.items():
+        if check == "no_risk_downgrade":
+            passed = _raw_no_risk_downgrade_passes(results)
+        else:
+            passed = sum(result["raw_checks"][check] for result in results)
+        rate = passed / total if total else 0.0
+        if rate < minimum:
+            failures.append(
+                "{}: raw pass rate {:.1%} is below required {:.1%}".format(
+                    check, rate, minimum
+                )
+            )
+    fallback_count = sum(result["fallback_used"] for result in results)
+    fallback_rate = fallback_count / total if total else 0.0
+    maximum_fallback_rate = thresholds["maximum_fallback_rate"]
+    if fallback_rate >= maximum_fallback_rate:
+        failures.append(
+            "fallback rate {:.1%} must be below maximum {:.1%}".format(
+                fallback_rate, maximum_fallback_rate
+            )
+        )
     return failures
 
 
@@ -594,6 +661,42 @@ def render_quality_gate(results, thresholds=None):
                 check, rate, minimum, result
             )
         )
+    return "\n".join(lines) + "\n"
+
+
+def render_raw_model_gate(results, thresholds=None):
+    """Render raw-model pass rates and fallback rate against configured targets."""
+    if thresholds is None:
+        thresholds = load_thresholds(section="raw_model")
+    total = len(results)
+    lines = [
+        "",
+        "## Raw-model quality gate",
+        "",
+        "| Check | Raw pass rate | Minimum | Result |",
+        "| --- | ---: | ---: | --- |",
+    ]
+    for check, minimum in thresholds["minimum_pass_rates"].items():
+        if check == "no_risk_downgrade":
+            passed = _raw_no_risk_downgrade_passes(results)
+        else:
+            passed = sum(result["raw_checks"][check] for result in results)
+        rate = passed / total if total else 0.0
+        outcome = "PASS" if rate >= minimum else "FAIL"
+        lines.append(
+            "| {} | {:.1%} ({}/{}) | {:.1%} | {} |".format(
+                check, rate, passed, total, minimum, outcome
+            )
+        )
+    fallback_count = sum(result["fallback_used"] for result in results)
+    fallback_rate = fallback_count / total if total else 0.0
+    maximum = thresholds["maximum_fallback_rate"]
+    outcome = "PASS" if fallback_rate < maximum else "FAIL"
+    lines.append(
+        "| fallback_rate | {:.1%} ({}/{}) | < {:.1%} | {} |".format(
+            fallback_rate, fallback_count, total, maximum, outcome
+        )
+    )
     return "\n".join(lines) + "\n"
 
 

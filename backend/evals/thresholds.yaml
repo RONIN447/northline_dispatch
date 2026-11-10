@@ -1,4 +1,4 @@
-final_pass_rates:
+final:
   route_matches_engine: 1.0
   worst_checkpoint_matches_engine: 1.0
   risk_counts_match_plan: 1.0
@@ -7,3 +7,12 @@ final_pass_rates:
   numbers_grounded: 1.0
   route_ids_grounded: 1.0
   place_names_grounded: 1.0
+raw_model:
+  minimum_pass_rates:
+    route_matches_engine: 1.0
+    no_risk_downgrade: 1.0
+    no_false_safe: 0.91
+    numbers_grounded: 0.91
+    route_ids_grounded: 0.91
+    place_names_grounded: 0.91
+  maximum_fallback_rate: 0.2
