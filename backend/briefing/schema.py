@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from routing.risk_levels import NO_TRAVEL, RISK_LEVELS, SEVERE
 
@@ -108,3 +108,17 @@ class Briefing(BaseModel):
     route_risks: List[RouteRiskSummary]
     data_gaps: List[str]
     dispatcher_actions: List[str]
+
+
+class BriefingNarrative(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(min_length=1)
+    dispatcher_actions: List[str] = Field(max_length=3)
+
+    @field_validator("summary")
+    @classmethod
+    def summary_under_word_limit(cls, value: str) -> str:
+        if len(value.split()) > 80:
+            raise ValueError("Summary must be under 80 words.")
+        return value

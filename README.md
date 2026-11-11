@@ -168,8 +168,10 @@ per scenario, and prints a review table. The evaluator runs all scenarios
 through the configured provider, checks both raw and validator-corrected
 briefings, and writes check pass rates, intervention counts, and fallback
 counts to `evals/reports/latest.md`. The report's final pass rates demonstrate
-the validator's behavior, not independent model quality; compare raw pass rates
-and correction rates when assessing model performance.
+the validator's behavior, not independent model quality. Raw checks cover the
+model-written narrative combined with deterministic fields assembled by the
+application; only narrative grounding and unsafe-reassurance checks measure
+model behavior.
 
 Select a briefing prompt for one evaluation with `--prompt v1` or `--prompt v2`.
 Compare both against the same scenario set with:
@@ -184,6 +186,50 @@ is saved under `evals/reports/raw/`. Use `--output PATH` to override the report
 path. Comparison reports include raw pass rates per check, fallback and retry
 rates, latency percentiles, average tokens, and the functional targets.
 
+For paced repeated runs, filter by category and limit the scenario count as
+needed. Each repetition is recorded separately in the raw JSONL:
+
+```powershell
+python -m django run_evals --prompt v2 --category forecast_unavailable --limit 3 --reps 2 --delay 2
+```
+
+Resume an interrupted run with its run ID and the same selection options;
+completed scenario/repetition pairs in that run's JSONL are skipped:
+
+```powershell
+python -m django run_evals --prompt v2 --category forecast_unavailable --limit 3 --reps 2 --resume <run-id>
+```
+
+Combine existing raw runs into one report with:
+
+```powershell
+python -m django run_evals --merge-runs evals/reports/raw/<run-1>.jsonl evals/reports/raw/<run-2>.jsonl
+```
+
+Provider waits and request latency are reported separately. Groq requests have
+a 30-second timeout and bounded 429 backoff; timed-out scenarios are written
+to JSONL with an error and evaluation continues.
+
+#### Grounding acceptance changelog
+
+The grounding detector accepts these plan-backed values; it does not apply a
+free-form numeric tolerance:
+
+| Value category | Accepted values | Tolerance |
+| --- | --- | --- |
+| Route and checkpoint measurements | Numeric fields in the supplied plan, including distances, durations, mile markers, risk miles, weather values, and risk scores | Exact value, nearest integer, or nearest tenth; rounding uses `ROUND_HALF_UP` |
+| Checkpoint counts and indices | Each route's checkpoint count, the total checkpoint count, and zero-based indices from `0` through `count - 1` | Exact integer only |
+| ETAs and forecast times | Numeric components extracted from route `arrival` and checkpoint `eta` / `forecastHour` timestamps | Components must match a supplied timestamp; the standard exact/integer/tenth representations apply. No time-shift tolerance |
+| Derived mileage sums | Sums of same-named route fields ending in `Miles`, plus each route's checkpoint `mile` markers | Exact sum, nearest integer, or nearest tenth; `ROUND_HALF_UP` |
+| Route IDs | IDs present in the plan; separators and case are normalized, and a `routeN` prefix alias is accepted for an ID with that route-number prefix | No other similarity or edit-distance tolerance |
+| Place names | Individual capitalized words present in supplied origin/destination values or route summaries, case-insensitively | No spelling, geographic, or fuzzy-match tolerance |
+
+Numbers are not accepted merely because they are close to a plan value: for
+example, a distance off by one mile remains unsupported unless that number is
+independently present or permitted by the stated rounding rules. Mutation tests
+exercise invented wind speed, invented distance, off-by-one distance, unknown
+route ID, and unknown place name against multiple saved plans.
+
 The CI quality gate requires 100% final pass rates for every check in the
 `final` section of `evals/thresholds.yaml`. CI runs this gate with `LLM_PROVIDER=mock`;
 that verifies the evaluation pipeline and deterministic guardrails only, not
@@ -197,10 +243,12 @@ $env:LLM_PROVIDER = "groq"
 python -m django run_evals --gate-raw
 ```
 
-`--gate-raw` refuses to run with the mock provider. It evaluates unmodified
-model-output pass rates and fallback rate against the `raw_model` section of
-`evals/thresholds.yaml`; it is not part of CI. Run `python -m django run_evals`
-without either gate option to generate a report without enforcing thresholds.
+`--gate-raw` refuses to run with the mock provider. It evaluates narrative
+grounding, unsafe reassurance, and fallback rate against the `raw_model`
+section of `evals/thresholds.yaml`; plan-derived route and risk fields are
+covered by the final-output gate instead. This command is not part of CI. Run
+`python -m django run_evals` without either gate option to generate a report
+without enforcing thresholds.
 
 The gate was verified with an intentionally broken validator and
 `MOCK_MODE=faulty_number` on a temporary branch. The run failed as expected on
@@ -216,9 +264,7 @@ It defaults to the deterministic mock provider:
 
 ```powershell
 $env:LLM_PROVIDER = "mock"
-$env:MOCK_MODE = "normal" # faulty_route, faulty_missing_checkpoint, faulty_number,
-                          # faulty_downgrade, faulty_no_gap, faulty_route_id,
-                          # faulty_place each exercise a specific check
+$env:MOCK_MODE = "normal" # faulty_number, faulty_route_id, faulty_place, faulty_safe
 ```
 
 Use `LLM_PROVIDER=anthropic` with `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`,
@@ -248,15 +294,36 @@ safeguard.
 `briefing.service.generate_briefing(plan)` sends only route summaries and
 checkpoint weather/risk data (not route geometry), bounds location labels, and
 delimits the plan as untrusted data. It validates the response against the
-`Briefing` schema and retries once with the parse/validation error if needed.
+`BriefingNarrative` schema and retries once with the parse/validation error if
+needed.
 Provider API failures raise a separate request error; output validation failure
 after retry raises a generation error. Hosted requests use temperature 0 and a
 1,200-token output cap, except Groq uses `GROQ_MAX_TOKENS` (default `4096`).
 Groq requests for `gpt-oss` models also set low reasoning effort. The service
-returns the validated briefing and provider, prompt, token, latency, and retry
-metadata. Prompt v2 is the default; set `PROMPT_VERSION=v1` to select v1.
-Both prompts include a schema generated from the Pydantic `Briefing` model;
-behavioral safety checks are implemented separately from generation.
+returns the narrative combined with deterministic plan-derived fields, plus
+provider, prompt, token, latency, and retry metadata. Prompt v2 is the default;
+set `PROMPT_VERSION=v1` to select v1. Both prompts include a schema generated
+from the Pydantic `BriefingNarrative` model.
+
+#### Why the model writes narrative only
+
+The repeated forecast-gap evaluation found real model errors while copying
+facts already present in the route plan: wrong worst-checkpoint indices and
+levels, omitted risk ranges, missing forecast-gap entries, and abbreviated
+route IDs. The application now computes the recommendation, per-route worst
+checkpoints, Severe/No Travel counts and ranges, and exact forecast gaps
+deterministically. The model writes only the summary and dispatcher actions;
+those narrative fields are still checked for unsupported numbers, route IDs,
+place names, and unsafe reassurance. This deliberately narrows the LLM's role
+to prose so a generation error cannot alter the structured risk facts. The
+`/api/briefing/` response shape remains unchanged.
+
+Because of that boundary, raw pass rates for route selection, risk summaries,
+and data gaps describe application-computed output, not model accuracy. The
+manual raw-model gate is limited to narrative checks and fallback rate; the
+final-output gate continues to require 100% on all checks. Reports made before
+this narrative-only contract are historical and are not directly comparable
+with newer raw-model reports.
 
 `briefing.validator.enforce(plan, briefing)` applies deterministic safety
 corrections and returns `(final_briefing, interventions, fallback_used)`.

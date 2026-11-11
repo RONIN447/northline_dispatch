@@ -1,10 +1,12 @@
 """Fault injection tests for the independent briefing evaluation checks."""
 
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import unittest
 
 from briefing.providers import MockProvider
-from briefing.schema import Briefing
+from briefing.schema import BriefingNarrative
+from briefing.service import generate_briefing
 from briefing.validator import enforce
 from evals.checks import evaluate_checks, expected_data_gaps, expected_route_risks
 from evals.grounding import check_grounding, find_offending_tokens
@@ -29,18 +31,10 @@ class BriefingCheckTests(unittest.TestCase):
     def test_each_check_fails_for_a_matching_faulty_mock_and_final_passes(self):
         cases = (
             ("faulty_route", self.severe_scenario, "route_matches_engine"),
-            (
-                "faulty_worst_checkpoint",
-                self.severe_scenario,
-                "worst_checkpoint_matches_engine",
-            ),
+            ("faulty_worst_checkpoint", self.severe_scenario, "worst_checkpoint_matches_engine"),
             ("faulty_risk_count", self.severe_scenario, "risk_counts_match_plan"),
-            (
-                "faulty_risk_range",
-                self.severe_scenario,
-                "risk_ranges_cover_checkpoints",
-            ),
-            ("faulty_no_gap", self.gap_scenario, "no_false_safe"),
+            ("faulty_risk_range", self.severe_scenario, "risk_ranges_cover_checkpoints"),
+            ("faulty_no_gap", self.gap_scenario, "data_gaps_match_plan"),
             ("faulty_safe", self.severe_scenario, "no_false_safe"),
             ("faulty_number", self.severe_scenario, "numbers_grounded"),
             ("faulty_route_id", self.severe_scenario, "route_ids_grounded"),
@@ -48,8 +42,32 @@ class BriefingCheckTests(unittest.TestCase):
         )
         for mode, scenario, failed_check in cases:
             with self.subTest(mode=mode, check=failed_check):
-                response = MockProvider(mode).generate("", json.dumps(scenario["plan"]))
-                raw = Briefing.model_validate_json(response.text)
+                raw, _ = generate_briefing(
+                    scenario["plan"], provider=MockProvider("normal")
+                )
+                if mode == "faulty_route":
+                    raw.recommended_route_id = next(
+                        route["id"]
+                        for route in scenario["plan"]["routes"]
+                        if route["id"] != raw.recommended_route_id
+                    )
+                elif mode == "faulty_worst_checkpoint":
+                    item = raw.route_risks[0].worst_checkpoint
+                    item.level = "Low" if item.level != "Low" else "Moderate"
+                elif mode == "faulty_risk_count":
+                    raw.route_risks[0].severe_count += 1
+                elif mode == "faulty_risk_range":
+                    item = next(item for item in raw.route_risks if item.risk_ranges)
+                    item.risk_ranges = []
+                elif mode == "faulty_no_gap":
+                    raw.data_gaps = []
+                else:
+                    response = MockProvider(mode).generate(
+                        "", json.dumps(scenario["plan"])
+                    )
+                    narrative = BriefingNarrative.model_validate_json(response.text)
+                    raw.summary = narrative.summary
+                    raw.dispatcher_actions = narrative.dispatcher_actions
                 raw_checks = evaluate_checks(raw, scenario["plan"])
                 self.assertFalse(raw_checks[failed_check])
 
@@ -60,10 +78,9 @@ class BriefingCheckTests(unittest.TestCase):
     def test_rule_based_mock_passes_all_checks_on_all_scenarios(self):
         for scenario in load_scenarios():
             with self.subTest(scenario=scenario["id"]):
-                response = MockProvider("normal").generate(
-                    "", json.dumps(scenario["plan"])
+                briefing, _ = generate_briefing(
+                    scenario["plan"], provider=MockProvider("normal")
                 )
-                briefing = Briefing.model_validate_json(response.text)
                 self.assertTrue(
                     all(evaluate_checks(briefing, scenario["plan"]).values())
                 )
@@ -141,6 +158,17 @@ class BriefingCheckTests(unittest.TestCase):
                 "route-2 checkpoint 0 is missing windMph.",
             ],
         )
+
+    def test_missing_forecast_gap_is_not_misclassified_as_false_safe(self):
+        briefing, _ = generate_briefing(
+            self.gap_scenario["plan"], provider=MockProvider("normal")
+        )
+        briefing = briefing.model_copy(update={"data_gaps": []})
+
+        checks = evaluate_checks(briefing, self.gap_scenario["plan"])
+
+        self.assertFalse(checks["data_gaps_match_plan"])
+        self.assertTrue(checks["no_false_safe"])
 
     @staticmethod
     def _plan_with_checkpoints(checkpoints, route_id="route-1"):
@@ -221,19 +249,58 @@ class BriefingGroundingTests(unittest.TestCase):
                     find_offending_tokens(briefing, plan)["route_ids"], []
                 )
 
-    def test_checkpoint_counts_indices_eta_and_summed_miles_are_grounded(self):
-        plan = self.sfo_scenario["plan"]
-        summary = (
-            "The routes total 1,190.1 miles across 52 checkpoints. "
-            "Checkpoint 16 is at mile 400; ETA 2026-10-21T18:00."
-        )
-        briefing = self._briefing(self.sfo_scenario, summary)
+    def test_plan_derived_numbers_are_grounded_across_saved_plans(self):
+        for scenario in self.mutation_scenarios:
+            with self.subTest(scenario=scenario["id"]):
+                plan = scenario["plan"]
+                routes = plan["routes"]
+                route = routes[0]
+                route_distance = Decimal(str(route["distanceMiles"]))
+                rounded_route_distance = route_distance.quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+                summed_route_distance = sum(
+                    Decimal(str(item["distanceMiles"])) for item in routes
+                )
+                rounded_summed_route_distance = summed_route_distance.quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP
+                )
+                checkpoint_count = sum(
+                    len(item["checkpoints"]) for item in routes
+                )
+                checkpoint_index = min(16, len(route["checkpoints"]) - 1)
+                checkpoint = route["checkpoints"][checkpoint_index]
+                summed_mile_markers = sum(
+                    Decimal(str(item["mile"])) for item in route["checkpoints"]
+                )
+                rounded_mile_marker_sum = summed_mile_markers.quantize(
+                    Decimal("0.1"), rounding=ROUND_HALF_UP
+                )
+                summary = (
+                    "Route {} is {} miles ({} exact). Combined route distance is "
+                    "{} miles; checkpoint count is {}. Checkpoint {} is at mile {} "
+                    "with ETA {}. The route's summed checkpoint mile markers are "
+                    "{} miles."
+                ).format(
+                    route["id"],
+                    rounded_route_distance,
+                    route_distance,
+                    rounded_summed_route_distance,
+                    checkpoint_count,
+                    checkpoint_index,
+                    checkpoint["mile"],
+                    checkpoint["eta"],
+                    rounded_mile_marker_sum,
+                )
+                briefing = self._briefing(scenario, summary)
 
-        self.assertNotIn("unsupported_number", check_grounding(briefing, plan))
-        self.assertEqual(
-            find_offending_tokens(briefing, plan)["numbers"],
-            [],
-        )
+                self.assertNotIn(
+                    "unsupported_number", check_grounding(briefing, plan)
+                )
+                self.assertEqual(
+                    find_offending_tokens(briefing, plan)["numbers"],
+                    [],
+                )
 
     def test_invented_number_route_id_and_place_name_still_fail(self):
         scenario = self.sfo_scenario
@@ -314,20 +381,18 @@ class BriefingGroundingTests(unittest.TestCase):
 
     @staticmethod
     def _briefing(scenario, summary):
-        response = MockProvider("normal").generate(
-            "", json.dumps(scenario["plan"])
+        briefing, _ = generate_briefing(
+            scenario["plan"], provider=MockProvider("normal")
         )
-        briefing = Briefing.model_validate_json(response.text)
         briefing.summary = summary
         briefing.dispatcher_actions = []
         return briefing
 
     @staticmethod
     def _valid_briefing(scenario):
-        response = MockProvider("normal").generate(
-            "", json.dumps(scenario["plan"])
+        briefing, _ = generate_briefing(
+            scenario["plan"], provider=MockProvider("normal")
         )
-        briefing = Briefing.model_validate_json(response.text)
         if not all(evaluate_checks(briefing, scenario["plan"]).values()):
             raise AssertionError("The mutation baseline briefing must pass all checks.")
         return briefing

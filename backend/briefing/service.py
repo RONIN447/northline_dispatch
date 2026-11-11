@@ -18,6 +18,8 @@ from briefing.providers import (
     get_provider,
 )
 from briefing.schema import Briefing
+from briefing.schema import BriefingNarrative, RouteRiskSummary
+from evals.checks import expected_data_gaps, expected_route_risks
 
 _CODE_FENCE_PATTERN = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
@@ -61,6 +63,8 @@ class BriefingMetadata:
     retry_count: int
     raw_output: str = ""
     finish_reason: Optional[str] = None
+    wait_ms: float = 0.0
+    wait_events: Optional[list] = None
 
 
 class BriefingGenerationError(ValueError):
@@ -81,6 +85,8 @@ def generate_briefing(
     input_tokens = 0
     output_tokens = 0
     latency_ms = 0.0
+    wait_ms = 0.0
+    wait_events = []
     last_error = None
 
     for attempt in range(2):
@@ -89,7 +95,7 @@ def generate_briefing(
                 trimmed_plan,
                 correction=(
                     "The previous response failed to parse or validate. Correct the "
-                    "output to match the required Briefing schema. Error: {}".format(
+                    "output to match the required BriefingNarrative schema. Error: {}".format(
                         str(last_error)[:500]
                     )
                 ),
@@ -98,13 +104,15 @@ def generate_briefing(
         input_tokens += response.input_tokens or 0
         output_tokens += response.output_tokens or 0
         latency_ms += response.latency_ms
+        wait_ms += response.wait_ms
+        wait_events.extend(response.wait_events or [])
 
         try:
             if (response.finish_reason or "").lower() == "length":
                 raise ValueError(
                     "Provider response was truncated (finish reason: length)."
                 )
-            briefing = Briefing.model_validate_json(
+            narrative = BriefingNarrative.model_validate_json(
                 _extract_json_object(response.text)
             )
         except (json.JSONDecodeError, ValidationError) as error:
@@ -124,12 +132,29 @@ def generate_briefing(
             retry_count=attempt,
             raw_output=response.text,
             finish_reason=response.finish_reason,
+            wait_ms=wait_ms,
+            wait_events=wait_events,
         )
+        briefing = compose_briefing(plan, narrative)
         return briefing, metadata
 
     raise BriefingGenerationError(
         "Provider returned invalid briefing JSON after 2 attempts: {}".format(last_error)
     ) from last_error
+
+
+def compose_briefing(plan: Dict[str, Any], narrative: BriefingNarrative) -> Briefing:
+    """Combine model-written narrative with deterministic plan-derived fields."""
+    return Briefing(
+        recommended_route_id=plan["recommendedRouteId"],
+        summary=narrative.summary,
+        route_risks=[
+            RouteRiskSummary.model_validate(item)
+            for item in expected_route_risks(plan)
+        ],
+        data_gaps=expected_data_gaps(plan),
+        dispatcher_actions=narrative.dispatcher_actions,
+    )
 
 
 def _trim_plan(plan: Dict[str, Any]) -> Dict[str, Any]:

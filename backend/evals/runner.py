@@ -4,8 +4,12 @@ from collections import Counter
 import csv
 from datetime import datetime, timezone
 import json
+import logging
 import math
 from pathlib import Path
+import queue
+import threading
+import time
 
 from briefing.providers import get_provider
 from briefing.validator import enforce
@@ -18,6 +22,7 @@ CHECK_NAMES = (
     "worst_checkpoint_matches_engine",
     "risk_counts_match_plan",
     "risk_ranges_cover_checkpoints",
+    "data_gaps_match_plan",
     "no_false_safe",
     "numbers_grounded",
     "route_ids_grounded",
@@ -33,7 +38,8 @@ FAILURE_REASONS = {
     "worst_checkpoint_matches_engine": "The reported worst checkpoint did not match the engine.",
     "risk_counts_match_plan": "Reported Severe or No Travel counts did not match the plan.",
     "risk_ranges_cover_checkpoints": "One or more Severe or No Travel checkpoints fell outside the listed risk ranges.",
-    "no_false_safe": "The briefing omitted required risk or forecast-gap data, or made an unsafe reassurance claim.",
+    "data_gaps_match_plan": "The reported forecast gaps did not match missing weather fields in the plan.",
+    "no_false_safe": "The briefing made an unsafe reassurance claim.",
     "numbers_grounded": "The briefing included a number not supported by the route plan.",
     "route_ids_grounded": "The briefing included a route ID not present in the route plan.",
     "place_names_grounded": "The briefing included a place name not grounded in the route plan.",
@@ -49,6 +55,7 @@ CATEGORY_LABELS = {
 REPORT_PATH = Path(__file__).resolve().parent / "reports" / "latest.md"
 RAW_REPORT_DIR = REPORT_PATH.parent / "raw"
 THRESHOLDS_PATH = Path(__file__).resolve().parent / "thresholds.yaml"
+_logger = logging.getLogger(__name__)
 
 
 def create_run_id():
@@ -62,8 +69,15 @@ def run_evaluations(
     run_id=None,
     raw_output_path=None,
     append_raw_output=False,
+    repetition=1,
+    delay_seconds=0.0,
+    timeout_seconds=30.0,
+    completed_scenarios=None,
+    provider_name=None,
+    model_name=None,
+    prompt_version=None,
 ):
-    """Evaluate every scenario and return report text plus structured results."""
+    """Evaluate scenarios, recording per-call timeouts and optional pacing."""
     if scenarios is None:
         scenarios = load_scenarios()
     if run_id is None:
@@ -83,9 +97,52 @@ def run_evaluations(
     results = []
     intervention_counts = Counter()
     fallback_count = 0
+    completed_scenarios = set(completed_scenarios or ())
+    first_call = True
     for scenario in scenarios:
+        if scenario["id"] in completed_scenarios:
+            continue
+        wait_events = []
+        if not first_call and delay_seconds:
+            _logger.info(
+                "Evaluation pacing wait run_id=%s repetition=%s scenario_id=%s "
+                "duration_seconds=%.3f",
+                run_id,
+                repetition,
+                scenario["id"],
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+            wait_events.append(
+                {
+                    "reason": "evaluation pacing delay",
+                    "duration_ms": delay_seconds * 1000,
+                }
+            )
+        first_call = False
         plan = scenario["plan"]
-        raw, metadata = generate(plan)
+        try:
+            raw, metadata = _call_with_timeout(generate, plan, timeout_seconds)
+        except TimeoutError:
+            error = "Briefing generation timed out after {:.1f} seconds.".format(
+                timeout_seconds
+            )
+            result = _timeout_result(
+                scenario,
+                run_id,
+                repetition,
+                error,
+                wait_events,
+                provider_name,
+                model_name,
+                prompt_version,
+            )
+            results.append(result)
+            if raw_output_path is not None:
+                write_raw_results(results[-1:], raw_output_path, run_id, append=True)
+            completed_scenarios.add(scenario["id"])
+            continue
+        wait_events.extend(metadata.wait_events or [])
         raw_checks = evaluate_checks(raw, plan)
         offending_tokens = find_offending_tokens(raw, plan)
         final, interventions, fallback_used = enforce(plan, raw)
@@ -96,6 +153,8 @@ def run_evaluations(
             {
                 "id": scenario["id"],
                 "run_id": run_id,
+                "repetition": repetition,
+                "error": None,
                 "category": scenario.get("category", "uncategorized"),
                 "provider": metadata.provider,
                 "model": metadata.model,
@@ -121,6 +180,12 @@ def run_evaluations(
                 "total_tokens": metadata.input_tokens + metadata.output_tokens,
                 "latency_ms": metadata.latency_ms,
                 "finish_reason": metadata.finish_reason,
+                "wait_ms": metadata.wait_ms + sum(
+                    event["duration_ms"]
+                    for event in wait_events
+                    if event["reason"] == "evaluation pacing delay"
+                ),
+                "wait_events": wait_events,
                 "retry_count": metadata.retry_count,
                 "interventions": [item.rule for item in interventions],
                 "intervention_details": [
@@ -134,9 +199,79 @@ def run_evaluations(
             write_raw_results(
                 results[-1:], raw_output_path, run_id, append=True
             )
+        completed_scenarios.add(scenario["id"])
 
     report = render_report(results, intervention_counts, fallback_count, run_id)
     return report, results
+
+
+def _call_with_timeout(generate, plan, timeout_seconds):
+    result_queue = queue.Queue(maxsize=1)
+
+    def invoke():
+        try:
+            result_queue.put((True, generate(plan)))
+        except Exception as error:
+            result_queue.put((False, error))
+
+    worker = threading.Thread(target=invoke, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        raise TimeoutError()
+    succeeded, result = result_queue.get_nowait()
+    if not succeeded:
+        raise result
+    return result
+
+
+def _timeout_result(
+    scenario,
+    run_id,
+    repetition,
+    error,
+    wait_events,
+    provider_name,
+    model_name,
+    prompt_version,
+):
+    false_checks = {check: False for check in CHECK_NAMES}
+    return {
+        "id": scenario["id"],
+        "run_id": run_id,
+        "repetition": repetition,
+        "error": error,
+        "category": scenario.get("category", "uncategorized"),
+        "provider": provider_name or "unknown",
+        "model": model_name or "unknown",
+        "prompt_version": prompt_version or "unknown",
+        "raw_llm_output": "",
+        "parsed_briefing": None,
+        "expected_data_gaps": expected_data_gaps(scenario["plan"]),
+        "final_output": "",
+        "raw_checks": false_checks,
+        "final_checks": false_checks.copy(),
+        "failed_checks": [
+            {
+                "check": check,
+                "offending_tokens": {
+                    name: [] for name in ("numbers", "route_ids", "place_names")
+                },
+            }
+            for check in CHECK_NAMES
+        ],
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "latency_ms": 0.0,
+        "wait_ms": sum(event["duration_ms"] for event in wait_events),
+        "wait_events": wait_events,
+        "finish_reason": None,
+        "retry_count": 0,
+        "interventions": [],
+        "intervention_details": [],
+        "fallback_used": False,
+    }
 
 
 def _offending_tokens_for_check(check, offending_tokens, briefing, route_plan):
@@ -173,6 +308,7 @@ def render_report(
         "- Prompt version: {}".format(", ".join(prompt_versions) or "unknown"),
         "- Run ID: {}".format(run_id or "unknown"),
         "- Raw scenario data: raw/{}.jsonl".format(run_id or "unknown"),
+        "- Raw-check basis: model narrative composed with plan-derived route facts.",
         "",
         "Scenarios: {} | Raw briefings: {} | Validator-corrected briefings: {}".format(
             total, total, total
@@ -195,6 +331,11 @@ def render_report(
             _average([result["total_tokens"] for result in results]),
             _average([result["input_tokens"] for result in results]),
             _average([result["output_tokens"] for result in results]),
+        ),
+        "Timeout/error records: {} | Wait time total: {:.1f} ms "
+        "(separate from provider latency)".format(
+            sum(bool(result.get("error")) for result in results),
+            sum(result.get("wait_ms", 0.0) for result in results),
         ),
         "",
         "| Check | Raw pass rate | Final pass rate |",
@@ -323,6 +464,7 @@ def render_comparison_report(results_by_version, run_ids=None):
         "- Model: {}".format(", ".join(models) or "unknown"),
         "- Scenarios per version: {}".format(total),
         "- Scenario set: identical across v1 and v2",
+        "- Raw-check basis: model narrative composed with plan-derived route facts.",
     ]
     for version in ("v1", "v2"):
         run_id = (run_ids or {}).get(version, "unknown")
@@ -384,8 +526,9 @@ def render_comparison_report(results_by_version, run_ids=None):
             "",
             "## Functional targets",
             "",
-            "Targets: fallback rate under 20%; raw route_matches_engine and derived "
-            "no_risk_downgrade at 100%; each raw grounding check above 90%.",
+            "Targets: fallback rate under 20%; narrative no_false_safe and each raw "
+            "grounding check above 90%. Route and risk facts are application-computed "
+            "and checked by the final-output gate.",
             "",
             "| Target | v1 | v2 |",
             "| --- | --- | --- |",
@@ -400,6 +543,10 @@ def render_comparison_report(results_by_version, run_ids=None):
             ),
             "route_matches_engine": _percentage(
                 sum(result["raw_checks"]["route_matches_engine"] for result in results),
+                total,
+            ),
+            "no_false_safe": _percentage(
+                sum(result["raw_checks"]["no_false_safe"] for result in results),
                 total,
             ),
             "no_risk_downgrade": _percentage(
@@ -420,8 +567,7 @@ def render_comparison_report(results_by_version, run_ids=None):
         }
         target_results = {
             "fallback under 20%": rates["fallback"] < 20,
-            "route_matches_engine at 100%": rates["route_matches_engine"] == 100,
-            "no_risk_downgrade at 100%": rates["no_risk_downgrade"] == 100,
+            "narrative no_false_safe above 90%": rates["no_false_safe"] > 90,
             "numbers_grounded above 90%": rates["numbers_grounded"] > 90,
             "route_ids_grounded above 90%": rates["route_ids_grounded"] > 90,
             "place_names_grounded above 90%": rates["place_names_grounded"] > 90,
@@ -441,8 +587,9 @@ def render_comparison_report(results_by_version, run_ids=None):
     lines.extend(
         [
             "",
-            "The derived no_risk_downgrade rate requires all raw worst-checkpoint, "
-            "risk-count, and risk-range checks to pass for a scenario.",
+            "Route selection, risk summaries, and forecast gaps are computed from the "
+            "plan by application code. The raw-model gate covers narrative quality; "
+            "the final-output gate verifies the assembled response.",
             "",
         ]
     )
@@ -464,7 +611,9 @@ def write_raw_results(results, path, run_id, append=False):
         for result in results:
             record = {
                 "run_id": run_id,
+                "repetition": result.get("repetition", 1),
                 "scenario_id": result["id"],
+                "error": result.get("error"),
                 "category": result["category"],
                 "provider": result["provider"],
                 "model": result["model"],
@@ -473,16 +622,122 @@ def write_raw_results(results, path, run_id, append=False):
                 "parsed_briefing": result["parsed_briefing"],
                 "expected_data_gaps": result["expected_data_gaps"],
                 "raw_checks": result["raw_checks"],
+                "final_checks": result["final_checks"],
                 "failed_checks": result["failed_checks"],
                 "retry_count": result["retry_count"],
                 "input_tokens": result["input_tokens"],
                 "output_tokens": result["output_tokens"],
                 "latency_ms": result["latency_ms"],
+                "wait_ms": result.get("wait_ms", 0.0),
+                "wait_events": result.get("wait_events", []),
                 "finish_reason": result["finish_reason"],
                 "interventions": result["intervention_details"],
                 "fallback_used": result["fallback_used"],
             }
             output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def read_raw_results(paths):
+    """Load JSONL records from one or more evaluation runs with line-level errors."""
+    records = []
+    for path in paths:
+        path = Path(path)
+        with path.open(encoding="utf-8") as input_file:
+            for line_number, line in enumerate(input_file, 1):
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "{}:{} is not valid JSONL.".format(path, line_number)
+                    ) from error
+    return records
+
+
+def render_merged_report(records, raw_paths):
+    """Render one aggregate report from saved raw JSONL records."""
+    if not records:
+        raise ValueError("No evaluation records were found in the selected JSONL files.")
+    run_ids = list(dict.fromkeys(record.get("run_id", "unknown") for record in records))
+    providers = sorted({record.get("provider", "unknown") for record in records})
+    models = sorted({record.get("model", "unknown") for record in records})
+    prompts = sorted({record.get("prompt_version", "unknown") for record in records})
+    total = len(records)
+    lines = [
+        "# Merged briefing evaluation report",
+        "",
+        "- Date (UTC): {}".format(datetime.now(timezone.utc).date().isoformat()),
+        "- Mode: merged raw-model report",
+        "- Provider: {}".format(", ".join(providers)),
+        "- Model: {}".format(", ".join(models)),
+        "- Prompt version(s): {}".format(", ".join(prompts)),
+        "- Run IDs: {}".format(", ".join(run_ids)),
+        "- Raw-check basis: model narrative composed with plan-derived route facts.",
+        "",
+        "Records: {} | Timeout/error records: {}".format(
+            total, sum(bool(record.get("error")) for record in records)
+        ),
+        "Fallback rate: {}/{} ({:.1f}%) | Retry rate: {}/{} ({:.1f}%)".format(
+            sum(bool(record.get("fallback_used")) for record in records),
+            total,
+            _percentage(
+                sum(bool(record.get("fallback_used")) for record in records), total
+            ),
+            sum(int(record.get("retry_count", 0)) > 0 for record in records),
+            total,
+            _percentage(
+                sum(int(record.get("retry_count", 0)) > 0 for record in records),
+                total,
+            ),
+        ),
+        "Latency p50: {:.1f} ms | p95: {:.1f} ms | Average tokens: {:.1f}".format(
+            _percentile(
+                [float(record.get("latency_ms", 0.0)) for record in records], 50
+            ),
+            _percentile(
+                [float(record.get("latency_ms", 0.0)) for record in records], 95
+            ),
+            _average(
+                [
+                    int(record.get("input_tokens", 0))
+                    + int(record.get("output_tokens", 0))
+                    for record in records
+                ]
+            ),
+        ),
+        "Wait time total: {:.1f} ms (excluded from provider latency).".format(
+            sum(float(record.get("wait_ms", 0.0)) for record in records)
+        ),
+        "",
+        "| Check | Raw pass rate |",
+        "| --- | ---: |",
+    ]
+    for check in CHECK_NAMES:
+        passed = sum(
+            bool(record.get("raw_checks", {}).get(check, False))
+            for record in records
+        )
+        lines.append(
+            "| {} | {}/{} ({:.1f}%) |".format(
+                check, passed, total, _percentage(passed, total)
+            )
+        )
+    lines.extend(["", "## Input JSONL files", ""])
+    lines.extend("- `{}`".format(Path(path).resolve()) for path in raw_paths)
+    lines.extend(["", "## Scenario records", "", "| Run ID | Rep | Category | Scenario | Error |", "|---|---:|---|---|---|"])
+    for record in records:
+        lines.append(
+            "| {} | {} | {} | {} | {} |".format(
+                record.get("run_id", "unknown"),
+                record.get("repetition", 1),
+                record.get("category", "unknown"),
+                record.get("scenario_id", "unknown"),
+                record.get("error") or "",
+            )
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def write_failure_analysis(results, path):
@@ -547,7 +802,12 @@ def load_thresholds(path=THRESHOLDS_PATH, section="final"):
         raw_pass_rates,
         set(CHECK_NAMES) | {"no_risk_downgrade"},
         "raw_model.minimum_pass_rates",
-        required={"route_matches_engine", "no_risk_downgrade"},
+        required={
+            "no_false_safe",
+            "numbers_grounded",
+            "route_ids_grounded",
+            "place_names_grounded",
+        },
     )
     maximum_fallback_rate = raw_model.get("maximum_fallback_rate")
     _validate_rate(maximum_fallback_rate, "raw_model.maximum_fallback_rate")
@@ -672,6 +932,9 @@ def render_raw_model_gate(results, thresholds=None):
     lines = [
         "",
         "## Raw-model quality gate",
+        "",
+        "Only narrative checks are gated here; route selection, risk summaries, and "
+        "forecast gaps are computed from the plan and checked by the final-output gate.",
         "",
         "| Check | Raw pass rate | Minimum | Result |",
         "| --- | ---: | ---: | --- |",

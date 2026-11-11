@@ -119,11 +119,11 @@ def evaluate_checks(briefing: Briefing, route_plan: dict) -> Dict[str, bool]:
         "risk_ranges_cover_checkpoints": _risk_ranges_cover_checkpoints(
             briefing, route_plan
         ),
-        "no_false_safe": (
+        "data_gaps_match_plan": (
             expected_gaps == set(briefing.data_gaps)
             and len(briefing.data_gaps) == len(expected_gaps)
-            and not false_safe_claim
         ),
+        "no_false_safe": not false_safe_claim,
         "numbers_grounded": "unsupported_number" not in grounding_errors,
         "route_ids_grounded": "unsupported_route_id" not in grounding_errors,
         "place_names_grounded": "unsupported_place_name" not in grounding_errors,
