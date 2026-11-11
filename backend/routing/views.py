@@ -19,6 +19,12 @@ except ModuleNotFoundError:
         class RequestException(RuntimeError):
             """Fallback exception used when the requests dependency is unavailable."""
 
+        class ConnectionError(RequestException):
+            """Fallback connection error."""
+
+        class Timeout(RequestException):
+            """Fallback timeout error."""
+
         @staticmethod
         def get(*args, **kwargs):
             raise RuntimeError(
@@ -135,22 +141,39 @@ def _sleep_before_retry(response=None, attempt=0):
     return delay_seconds
 
 
-def _perform_api_request(url, params=None, timeout=20, max_retries=3):
+def _perform_api_request(
+    url, params=None, timeout=20, max_retries=3, transient_retries=0
+):
     last_error = None
-    for attempt in range(max_retries + 1):
+    rate_limit_retries = 0
+    transient_retry_count = 0
+    for attempt in range(max_retries + transient_retries + 1):
         try:
             response = requests.get(url, params=params, timeout=timeout)
             status_code = getattr(response, "status_code", None)
-            if status_code == 429 and attempt < max_retries:
-                _sleep_before_retry(response, attempt)
+            if status_code == 429 and rate_limit_retries < max_retries:
+                _sleep_before_retry(response, rate_limit_retries)
+                rate_limit_retries += 1
                 continue
             response.raise_for_status()
             return response
         except requests.RequestException as error:
             last_error = error
             response = getattr(error, "response", None)
-            if response is not None and getattr(response, "status_code", None) == 429 and attempt < max_retries:
-                _sleep_before_retry(response, attempt)
+            if (
+                response is not None
+                and getattr(response, "status_code", None) == 429
+                and rate_limit_retries < max_retries
+            ):
+                _sleep_before_retry(response, rate_limit_retries)
+                rate_limit_retries += 1
+                continue
+            if (
+                isinstance(error, (requests.ConnectionError, requests.Timeout))
+                and transient_retry_count < transient_retries
+            ):
+                _sleep_before_retry(attempt=transient_retry_count)
+                transient_retry_count += 1
                 continue
             raise
     if last_error is not None:
@@ -265,7 +288,8 @@ def _weather_for_point_cached(latitude, longitude, arrival_time_iso):
             "wind_speed_unit": "mph",
             "precipitation_unit": "inch",
         },
-        timeout=20,
+        timeout=10,
+        transient_retries=1,
     )
     arrival_time = datetime.fromisoformat(arrival_time_iso)
     return parse_weather_forecast(response.json().get("hourly", {}), arrival_time)
@@ -347,7 +371,8 @@ def get_weather_for_locations(checkpoint_locations):
                 "wind_speed_unit": "mph",
                 "precipitation_unit": "inch",
             },
-            timeout=20,
+            timeout=10,
+            transient_retries=1,
         )
         forecast_data = response.json()
         forecasts = forecast_data if isinstance(forecast_data, list) else [forecast_data]

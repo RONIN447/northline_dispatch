@@ -138,6 +138,9 @@ Example request:
 ```
 
 The plan response includes the resolved endpoints, available route geometries, checkpoint ETAs and forecast conditions, risk summaries, and `recommendedRouteId`. Invalid input returns a client error with an explanatory message; unavailable forecast data is not silently classified as safe.
+Transient weather-provider connection failures and timeouts are retried once
+with a 10-second request timeout; if the retry also fails, planning returns an
+error instead of presenting an incomplete forecast as safe.
 
 Post the complete `/api/plan/` response as JSON to `/api/briefing/`. The briefing
 endpoint accepts request bodies up to 1 MB (to accommodate route geometry),

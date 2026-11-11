@@ -263,6 +263,37 @@ class WeatherForecastTests(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs["params"]["longitude"], "-120.000000,-121.000000")
         self.assertEqual(get.call_args.kwargs["params"]["hourly"], "rain,snowfall,wind_speed_10m")
 
+    def test_weather_request_retries_transient_ssl_failure_once(self):
+        with patch("routing.views.requests.get") as get, patch(
+            "routing.views._sleep_before_retry"
+        ) as sleep:
+            get.side_effect = [
+                requests.exceptions.SSLError("unexpected EOF during handshake"),
+                self.mock_response(self.hourly),
+            ]
+            locations = [(0, 37, -120, self.arrival)]
+
+            weather = get_weather_for_locations(locations)
+
+        self.assertEqual(len(weather), 1)
+        self.assertEqual(weather[0]["windMph"], 30)
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["timeout"] == 10 for call in get.call_args_list)
+        )
+        sleep.assert_called_once_with(attempt=0)
+
+    def test_weather_request_fails_after_one_transient_retry(self):
+        error = requests.exceptions.SSLError("unexpected EOF during handshake")
+        with patch("routing.views.requests.get", side_effect=error) as get, patch(
+            "routing.views._sleep_before_retry"
+        ) as sleep:
+            with self.assertRaises(requests.exceptions.SSLError):
+                get_weather_for_locations([(0, 37, -120, self.arrival)])
+
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(attempt=0)
+
     def test_forecast_request_days_cover_arrival_without_always_fetching_seven(self):
         latest_arrival = datetime.now(timezone.utc).replace(microsecond=0)
         locations = [(0, 37, -120, latest_arrival)]
@@ -331,6 +362,38 @@ class PlanRouteApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(json.loads(response.content), {"status": "ok"})
+
+    @patch(
+        "routing.views.get_weather_for_locations",
+        side_effect=requests.exceptions.SSLError("unexpected EOF during handshake"),
+    )
+    @patch(
+        "routing.views.build_checkpoint_locations",
+        return_value=[(0, 37, -120, datetime(2026, 10, 10, 12, tzinfo=timezone.utc))],
+    )
+    @patch("routing.views.fetch_route_options", return_value=[{}])
+    @patch("routing.views.geocode_location")
+    def test_plan_route_fails_closed_when_weather_remains_unavailable(
+        self, geocode_location, fetch_routes, checkpoints, get_weather
+    ):
+        geocode_location.side_effect = lambda name: {
+            "label": name,
+            "lat": 37,
+            "lon": -120,
+            "timezone": "UTC",
+        }
+        request = self.factory.post(
+            "/api/plan/",
+            data=json.dumps(self.payload),
+            content_type="application/json",
+        )
+
+        response = plan_route(request)
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("unavailable", json.loads(response.content)["error"])
+        self.assertNotIn("routes", json.loads(response.content))
+        get_weather.assert_called_once()
 
     @patch("routing.views.requests.get")
     def test_fetch_route_options_uses_distinct_via_routes_when_provider_returns_one(self, get):
