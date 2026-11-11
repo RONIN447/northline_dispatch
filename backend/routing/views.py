@@ -147,7 +147,7 @@ def _perform_api_request(
     last_error = None
     rate_limit_retries = 0
     transient_retry_count = 0
-    for attempt in range(max_retries + transient_retries + 1):
+    for _ in range(max_retries + transient_retries + 1):
         try:
             response = requests.get(url, params=params, timeout=timeout)
             status_code = getattr(response, "status_code", None)
