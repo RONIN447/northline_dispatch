@@ -1,5 +1,10 @@
 # Tier 1 repeated real-model evaluation (partial)
 
+> **Superseded:** This partial snapshot predates the completed comparison in
+> [tier1_prompt_selection_2026-11-13.md](./tier1_prompt_selection_2026-11-13.md).
+> Use that report for the current prompt-selection decision and consolidated
+> results.
+
 - Generated (UTC): 2026-11-11 05:44
 - Provider: groq
 - Model: openai/gpt-oss-20b
