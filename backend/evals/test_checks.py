@@ -234,6 +234,61 @@ class BriefingGroundingTests(unittest.TestCase):
             find_offending_tokens(briefing, self.denver_scenario["plan"])["place_names"],
         )
 
+    def test_dispatcher_action_verbs_are_not_misclassified_as_place_names(self):
+        briefing = self._briefing(
+            self.sfo_scenario,
+            "The recommended route has elevated risk.",
+        )
+        briefing.dispatcher_actions = [
+            "Notify the crew about the forecast gap.",
+            "Provide weather updates during dispatch.",
+            "Confirm conditions before departure.",
+            "Ensure the driver reviews the route.",
+        ]
+
+        self.assertNotIn(
+            "unsupported_place_name",
+            check_grounding(briefing, self.sfo_scenario["plan"]),
+        )
+        self.assertEqual(
+            find_offending_tokens(briefing, self.sfo_scenario["plan"])["place_names"],
+            [],
+        )
+
+    def test_unknown_place_remains_unsupported_after_action_verb(self):
+        briefing = self._briefing(
+            self.sfo_scenario,
+            "The recommended route has elevated risk.",
+        )
+        briefing.dispatcher_actions = ["Notify the crew traveling through Phoenix."]
+
+        self.assertIn(
+            "unsupported_place_name",
+            check_grounding(briefing, self.sfo_scenario["plan"]),
+        )
+        self.assertEqual(
+            find_offending_tokens(briefing, self.sfo_scenario["plan"])["place_names"],
+            ["Phoenix"],
+        )
+
+    def test_eta_month_names_and_dispatcher_verbs_are_not_place_names(self):
+        briefing = self._briefing(
+            self.boston_scenario,
+            "The supplied ETA is Oct 21, 2026.",
+        )
+        briefing.dispatcher_actions = ["Maintain communication with the driver."]
+
+        self.assertNotIn(
+            "unsupported_place_name",
+            check_grounding(briefing, self.boston_scenario["plan"]),
+        )
+        self.assertEqual(
+            find_offending_tokens(briefing, self.boston_scenario["plan"])[
+                "place_names"
+            ],
+            [],
+        )
+
     def test_formatted_route_id_variants_normalize_to_plan_route(self):
         plan = self.sfo_scenario["plan"]
         for route_text in ("ROUTE_1_ROUTABILITY", "Route 1", "route-1-routability"):
@@ -301,6 +356,20 @@ class BriefingGroundingTests(unittest.TestCase):
                     find_offending_tokens(briefing, plan)["numbers"],
                     [],
                 )
+
+    def test_plan_level_forecast_horizon_is_grounded_but_nearby_number_is_not(self):
+        plan = self.boston_scenario["plan"]
+        briefing = self._briefing(
+            self.boston_scenario,
+            "The supplied forecast horizon covers 48 hours.",
+        )
+
+        self.assertNotIn("unsupported_number", check_grounding(briefing, plan))
+        self.assertEqual(find_offending_tokens(briefing, plan)["numbers"], [])
+
+        briefing.summary += " The forecast horizon is 49 hours."
+        self.assertIn("unsupported_number", check_grounding(briefing, plan))
+        self.assertEqual(find_offending_tokens(briefing, plan)["numbers"], ["49"])
 
     def test_invented_number_route_id_and_place_name_still_fail(self):
         scenario = self.sfo_scenario

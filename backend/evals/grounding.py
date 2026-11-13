@@ -19,10 +19,14 @@ _NON_PLACE_WORDS = {
     "an",
     "and",
     "any",
+    "apr",
+    "april",
     "are",
     "around",
     "as",
     "at",
+    "aug",
+    "august",
     "avoid",
     "before",
     "brief",
@@ -30,16 +34,22 @@ _NON_PLACE_WORDS = {
     "checkpoint",
     "checkpoints",
     "consider",
+    "confirm",
     "conditions",
     "current",
     "data",
+    "dec",
+    "december",
     "delay",
     "dispatch",
     "distance",
     "driver",
     "estimated",
+    "ensure",
     "expected",
     "every",
+    "feb",
+    "february",
     "for",
     "forecast",
     "from",
@@ -50,17 +60,33 @@ _NON_PLACE_WORDS = {
     "if",
     "in",
     "is",
+    "jan",
+    "january",
+    "jul",
+    "july",
+    "jun",
+    "june",
     "listed",
     "low",
+    "maintain",
+    "mar",
+    "march",
+    "may",
     "medium",
     "miles",
     "moderate",
     "monitor",
     "no",
     "not",
+    "notify",
+    "nov",
+    "november",
     "of",
+    "oct",
+    "october",
     "or",
     "please",
+    "provide",
     "proceed",
     "rain",
     "recommended",
@@ -87,6 +113,9 @@ _NON_PLACE_WORDS = {
     "weather",
     "with",
     "wind",
+    "sep",
+    "sept",
+    "september",
 }
 
 
@@ -209,6 +238,10 @@ def _route_plan_numbers(route_plan):
     numbers = set()
     mile_field_sums = {}
     total_checkpoints = 0
+
+    for value in route_plan.values():
+        if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+            _add_number(numbers, value)
 
     for route in route_plan["routes"]:
         checkpoints = route["checkpoints"]

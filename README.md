@@ -220,9 +220,15 @@ free-form numeric tolerance:
 | Route and checkpoint measurements | Numeric fields in the supplied plan, including distances, durations, mile markers, risk miles, weather values, and risk scores | Exact value, nearest integer, or nearest tenth; rounding uses `ROUND_HALF_UP` |
 | Checkpoint counts and indices | Each route's checkpoint count, the total checkpoint count, and zero-based indices from `0` through `count - 1` | Exact integer only |
 | ETAs and forecast times | Numeric components extracted from route `arrival` and checkpoint `eta` / `forecastHour` timestamps | Components must match a supplied timestamp; the standard exact/integer/tenth representations apply. No time-shift tolerance |
+| Plan-level forecast horizon | The supplied `forecastHours` value | Exact value only |
 | Derived mileage sums | Sums of same-named route fields ending in `Miles`, plus each route's checkpoint `mile` markers | Exact sum, nearest integer, or nearest tenth; `ROUND_HALF_UP` |
 | Route IDs | IDs present in the plan; separators and case are normalized, and a `routeN` prefix alias is accepted for an ID with that route-number prefix | No other similarity or edit-distance tolerance |
 | Place names | Individual capitalized words present in supplied origin/destination values or route summaries, case-insensitively | No spelling, geographic, or fuzzy-match tolerance |
+
+Calendar month names in supplied ETAs and common dispatcher verbs (`Confirm`,
+`Ensure`, `Maintain`, `Monitor`, `Notify`, and `Provide`) are treated as time
+components or ordinary prose rather than place names; other unsupported
+capitalized place names remain rejected.
 
 Numbers are not accepted merely because they are close to a plan value: for
 example, a distance off by one mile remains unsupported unless that number is
