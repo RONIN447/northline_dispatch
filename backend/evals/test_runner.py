@@ -691,6 +691,37 @@ class EvaluationRunnerTests(unittest.TestCase):
             set(),
         )
 
+    def test_legacy_raw_records_render_missing_checks_as_failures(self):
+        from briefing.management.commands.run_evals import _results_for_gate
+
+        scenario = load_scenarios()[0]
+        old_checks = {
+            name: True
+            for name in CHECK_NAMES
+            if name != "data_gaps_match_plan"
+        }
+        results = _results_for_gate(
+            [
+                {
+                    "scenario_id": scenario["id"],
+                    "provider": "groq",
+                    "model": "legacy-model",
+                    "prompt_version": "v2",
+                    "raw_checks": old_checks,
+                    "fallback_used": False,
+                    "retry_count": 0,
+                    "latency_ms": 1,
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                }
+            ]
+        )
+
+        self.assertFalse(results[0]["raw_checks"]["data_gaps_match_plan"])
+        self.assertFalse(results[0]["final_checks"]["data_gaps_match_plan"])
+        report = render_report(results, {}, 0, "legacy-run")
+        self.assertIn("| data_gaps_match_plan | 0/1 (0.0%) | 0/1 (0.0%) |", report)
+
     def test_management_command_merges_raw_jsonl_files(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory

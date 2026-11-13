@@ -13,6 +13,7 @@ from briefing.providers import MockProvider, get_provider
 from briefing.service import generate_briefing
 from evals.runner import (
     CATEGORY_LABELS,
+    CHECK_NAMES,
     RAW_REPORT_DIR,
     create_run_id,
     REPORT_PATH,
@@ -386,14 +387,23 @@ def _provider_name(provider):
 def _results_for_gate(records):
     results = []
     for record in records:
+        raw_checks = record.get("raw_checks", {})
+        final_checks = record.get("final_checks", {})
         results.append(
             {
                 "id": record["scenario_id"],
                 "provider": record.get("provider", "unknown"),
                 "model": record.get("model", "unknown"),
                 "prompt_version": record.get("prompt_version", "unknown"),
-                "raw_checks": record.get("raw_checks", {}),
-                "final_checks": record.get("final_checks", {}),
+                "category": record.get("category", "uncategorized"),
+                "raw_checks": {
+                    check: bool(raw_checks.get(check, False))
+                    for check in CHECK_NAMES
+                },
+                "final_checks": {
+                    check: bool(final_checks.get(check, False))
+                    for check in CHECK_NAMES
+                },
                 "fallback_used": bool(record.get("fallback_used")),
                 "retry_count": int(record.get("retry_count", 0)),
                 "latency_ms": float(record.get("latency_ms", 0.0)),
