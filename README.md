@@ -169,9 +169,12 @@ through the configured provider, checks both raw and validator-corrected
 briefings, and writes check pass rates, intervention counts, and fallback
 counts to `evals/reports/latest.md`. The report's final pass rates demonstrate
 the validator's behavior, not independent model quality. Raw checks cover the
-model-written narrative combined with deterministic fields assembled by the
-application; only narrative grounding and unsafe-reassurance checks measure
-model behavior.
+model-written summary and dispatcher actions only. The report separates
+code-computed fact checks (recommendation, worst checkpoints, risk counts and
+ranges, and forecast gaps) from model-narrative checks (consistency with those
+facts, grounding, and unsafe reassurance). The model cannot author or alter
+fact fields; `briefing/facts.py` computes them from the route plan before the
+narrative request and assembles them into the API response.
 
 Select a briefing prompt for one evaluation with `--prompt v1` or `--prompt v2`.
 Compare both against the same scenario set with:
@@ -250,9 +253,10 @@ python -m django run_evals --gate-raw
 ```
 
 `--gate-raw` refuses to run with the mock provider. It evaluates narrative
-grounding, unsafe reassurance, and fallback rate against the `raw_model`
-section of `evals/thresholds.yaml`; plan-derived route and risk fields are
-covered by the final-output gate instead. This command is not part of CI. Run
+consistency with the computed route/risk/gap facts, grounding, unsafe
+reassurance, and fallback rate against the `raw_model` section of
+`evals/thresholds.yaml`; plan-derived fields are covered by the final-output
+gate instead. This command is not part of CI. Run
 `python -m django run_evals` without either gate option to generate a report
 without enforcing thresholds.
 
@@ -331,11 +335,11 @@ final-output gate continues to require 100% on all checks. Reports made before
 this narrative-only contract are historical and are not directly comparable
 with newer raw-model reports.
 
-`briefing.validator.enforce(plan, briefing)` applies deterministic safety
-corrections and returns `(final_briefing, interventions, fallback_used)`.
-Count interventions by `rule` and `fallback_used` to track how often generated
-text must be replaced; the validator verifies its result with the shared
-evaluation checks before returning.
+`briefing.validator.enforce(plan, briefing)` validates code-computed facts and
+the narrative. It replaces unsupported or contradictory narrative with a
+deterministic template, then returns
+`(final_briefing, interventions, fallback_used)`. Fact mismatches are treated
+as application errors rather than model corrections.
 
 Build the frontend for production:
 

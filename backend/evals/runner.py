@@ -11,34 +11,35 @@ import queue
 import threading
 import time
 
+from briefing.facts import compute_briefing_facts
 from briefing.providers import get_provider
 from briefing.validator import enforce
-from evals.checks import evaluate_checks, expected_data_gaps
+from evals.checks import evaluate_checks
 from evals.grounding import find_offending_tokens
 from evals.scenarios import load_scenarios
 
-CHECK_NAMES = (
+FACT_CHECK_NAMES = (
     "route_matches_engine",
     "worst_checkpoint_matches_engine",
     "risk_counts_match_plan",
     "risk_ranges_cover_checkpoints",
     "data_gaps_match_plan",
+)
+NARRATIVE_CHECK_NAMES = (
+    "narrative_consistent_with_facts",
     "no_false_safe",
     "numbers_grounded",
     "route_ids_grounded",
     "place_names_grounded",
 )
-NO_RISK_DOWNGRADE_CHECKS = (
-    "worst_checkpoint_matches_engine",
-    "risk_counts_match_plan",
-    "risk_ranges_cover_checkpoints",
-)
+CHECK_NAMES = FACT_CHECK_NAMES + NARRATIVE_CHECK_NAMES
 FAILURE_REASONS = {
     "route_matches_engine": "The generated recommendation did not match the engine-selected route.",
     "worst_checkpoint_matches_engine": "The reported worst checkpoint did not match the engine.",
     "risk_counts_match_plan": "Reported Severe or No Travel counts did not match the plan.",
     "risk_ranges_cover_checkpoints": "One or more Severe or No Travel checkpoints fell outside the listed risk ranges.",
     "data_gaps_match_plan": "The reported forecast gaps did not match missing weather fields in the plan.",
+    "narrative_consistent_with_facts": "The model narrative contradicted a code-computed route, risk, or forecast-gap fact.",
     "no_false_safe": "The briefing made an unsafe reassurance claim.",
     "numbers_grounded": "The briefing included a number not supported by the route plan.",
     "route_ids_grounded": "The briefing included a route ID not present in the route plan.",
@@ -121,6 +122,7 @@ def run_evaluations(
             )
         first_call = False
         plan = scenario["plan"]
+        code_facts = compute_briefing_facts(plan).model_dump(mode="json")
         try:
             raw, metadata = _call_with_timeout(generate, plan, timeout_seconds)
         except TimeoutError:
@@ -136,6 +138,7 @@ def run_evaluations(
                 provider_name,
                 model_name,
                 prompt_version,
+                code_facts,
             )
             results.append(result)
             if raw_output_path is not None:
@@ -159,9 +162,20 @@ def run_evaluations(
                 "provider": metadata.provider,
                 "model": metadata.model,
                 "prompt_version": metadata.prompt_version,
-                "raw_llm_output": metadata.raw_output or raw.model_dump_json(indent=2),
-                "parsed_briefing": raw.model_dump(mode="json"),
-                "expected_data_gaps": expected_data_gaps(plan),
+                "raw_llm_output": metadata.raw_output
+                or json.dumps(
+                    {
+                        "summary": raw.summary,
+                        "dispatcher_actions": raw.dispatcher_actions,
+                    },
+                    ensure_ascii=False,
+                ),
+                "parsed_narrative": {
+                    "summary": raw.summary,
+                    "dispatcher_actions": raw.dispatcher_actions,
+                },
+                "code_facts": code_facts,
+                "expected_data_gaps": code_facts["data_gaps"],
                 "final_output": final.model_dump_json(indent=2),
                 "raw_checks": raw_checks,
                 "final_checks": final_checks,
@@ -234,8 +248,10 @@ def _timeout_result(
     provider_name,
     model_name,
     prompt_version,
+    code_facts,
 ):
-    false_checks = {check: False for check in CHECK_NAMES}
+    checks = {check: True for check in FACT_CHECK_NAMES}
+    checks.update({check: False for check in NARRATIVE_CHECK_NAMES})
     return {
         "id": scenario["id"],
         "run_id": run_id,
@@ -246,11 +262,12 @@ def _timeout_result(
         "model": model_name or "unknown",
         "prompt_version": prompt_version or "unknown",
         "raw_llm_output": "",
-        "parsed_briefing": None,
-        "expected_data_gaps": expected_data_gaps(scenario["plan"]),
+        "parsed_narrative": None,
+        "code_facts": code_facts,
+        "expected_data_gaps": code_facts["data_gaps"],
         "final_output": "",
-        "raw_checks": false_checks,
-        "final_checks": false_checks.copy(),
+        "raw_checks": checks,
+        "final_checks": checks.copy(),
         "failed_checks": [
             {
                 "check": check,
@@ -258,7 +275,7 @@ def _timeout_result(
                     name: [] for name in ("numbers", "route_ids", "place_names")
                 },
             }
-            for check in CHECK_NAMES
+            for check in NARRATIVE_CHECK_NAMES
         ],
         "input_tokens": 0,
         "output_tokens": 0,
@@ -338,10 +355,39 @@ def render_report(
             sum(result.get("wait_ms", 0.0) for result in results),
         ),
         "",
-        "| Check | Raw pass rate | Final pass rate |",
+        "## Facts (code-computed)",
+        "",
+        "These checks validate fields assembled from the route plan; they are not "
+        "model-quality metrics.",
+        "",
+        "| Fact check | Raw pass rate | Final pass rate |",
         "| --- | ---: | ---: |",
     ]
-    for check in CHECK_NAMES:
+    for check in FACT_CHECK_NAMES:
+        raw_passes = sum(result["raw_checks"][check] for result in results)
+        final_passes = sum(result["final_checks"][check] for result in results)
+        lines.append(
+            "| {} | {}/{} ({:.1f}%) | {}/{} ({:.1f}%) |".format(
+                check,
+                raw_passes,
+                total,
+                _percentage(raw_passes, total),
+                final_passes,
+                total,
+                _percentage(final_passes, total),
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Narrative (model-generated)",
+            "",
+            "| Narrative check | Raw pass rate | Final pass rate |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    for check in NARRATIVE_CHECK_NAMES:
         raw_passes = sum(result["raw_checks"][check] for result in results)
         final_passes = sum(result["final_checks"][check] for result in results)
         lines.append(
@@ -361,7 +407,9 @@ def render_report(
             "",
             "## Pass rates by scenario category",
             "",
-            "| Category | Scenarios | Check | Raw pass rate | Final pass rate |",
+            "### Facts (code-computed)",
+            "",
+            "| Category | Scenarios | Fact check | Raw pass rate | Final pass rate |",
             "| --- | ---: | --- | ---: | ---: |",
         ]
     )
@@ -373,7 +421,42 @@ def render_report(
             result for result in results if result["category"] == category
         ]
         category_total = len(category_results)
-        for check in CHECK_NAMES:
+        for check in FACT_CHECK_NAMES:
+            raw_passes = sum(
+                result["raw_checks"][check] for result in category_results
+            )
+            final_passes = sum(
+                result["final_checks"][check] for result in category_results
+            )
+            lines.append(
+                "| {} | {} | {} | {:.1f}% ({}/{}) | {:.1f}% ({}/{}) |".format(
+                    CATEGORY_LABELS.get(category, category),
+                    category_total,
+                    check,
+                    _percentage(raw_passes, category_total),
+                    raw_passes,
+                    category_total,
+                    _percentage(final_passes, category_total),
+                    final_passes,
+                    category_total,
+                )
+            )
+
+    lines.extend(
+        [
+            "",
+            "### Narrative (model-generated)",
+            "",
+            "| Category | Scenarios | Narrative check | Raw pass rate | Final pass rate |",
+            "| --- | ---: | --- | ---: | ---: |",
+        ]
+    )
+    for category in categories:
+        category_results = [
+            result for result in results if result["category"] == category
+        ]
+        category_total = len(category_results)
+        for check in NARRATIVE_CHECK_NAMES:
             raw_passes = sum(
                 result["raw_checks"][check] for result in category_results
             )
@@ -413,21 +496,28 @@ def render_report(
             "",
             "## Scenario results",
             "",
-            "| Scenario | Provider | Raw checks passed | Final checks passed | Fallback |",
-            "| --- | --- | ---: | ---: | --- |",
+            "| Scenario | Provider | Code facts | Raw narrative | Final narrative | Fallback |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
         ]
     )
     for result in results:
-        raw_passes = sum(result["raw_checks"].values())
-        final_passes = sum(result["final_checks"].values())
+        fact_passes = sum(result["raw_checks"][check] for check in FACT_CHECK_NAMES)
+        raw_narrative_passes = sum(
+            result["raw_checks"][check] for check in NARRATIVE_CHECK_NAMES
+        )
+        final_narrative_passes = sum(
+            result["final_checks"][check] for check in NARRATIVE_CHECK_NAMES
+        )
         lines.append(
-            "| {} | {} | {}/{} | {}/{} | {} |".format(
+            "| {} | {} | {}/{} | {}/{} | {}/{} | {} |".format(
                 result["id"],
                 result["provider"],
-                raw_passes,
-                len(CHECK_NAMES),
-                final_passes,
-                len(CHECK_NAMES),
+                fact_passes,
+                len(FACT_CHECK_NAMES),
+                raw_narrative_passes,
+                len(NARRATIVE_CHECK_NAMES),
+                final_narrative_passes,
+                len(NARRATIVE_CHECK_NAMES),
                 "yes" if result["fallback_used"] else "no",
             )
         )
@@ -503,17 +593,16 @@ def render_comparison_report(results_by_version, run_ids=None):
                 _average([result["output_tokens"] for result in results]),
             ),
         }
-        for check in CHECK_NAMES:
-            passed = sum(result["raw_checks"][check] for result in results)
-            values["Raw: {}".format(check)] = "{}/{} ({:.1f}%)".format(
+        for check in FACT_CHECK_NAMES:
+            passed = sum(result["raw_checks"].get(check, False) for result in results)
+            values["Code facts: {}".format(check)] = "{}/{} ({:.1f}%)".format(
                 passed, total, _percentage(passed, total)
             )
-        no_risk_downgrade_passes = _raw_no_risk_downgrade_passes(results)
-        values["Raw: no_risk_downgrade (derived)"] = "{}/{} ({:.1f}%)".format(
-            no_risk_downgrade_passes,
-            total,
-            _percentage(no_risk_downgrade_passes, total),
-        )
+        for check in NARRATIVE_CHECK_NAMES:
+            passed = sum(result["raw_checks"].get(check, False) for result in results)
+            values["Model narrative: {}".format(check)] = "{}/{} ({:.1f}%)".format(
+                passed, total, _percentage(passed, total)
+            )
         if version == "v1":
             v1_values = values
         else:
@@ -526,9 +615,9 @@ def render_comparison_report(results_by_version, run_ids=None):
             "",
             "## Functional targets",
             "",
-            "Targets: fallback rate under 20%; narrative no_false_safe and each raw "
-            "grounding check above 90%. Route and risk facts are application-computed "
-            "and checked by the final-output gate.",
+            "Targets: fallback rate under 20%; model narrative consistency, "
+            "no_false_safe, and each raw grounding check above 90%. Route and risk "
+            "facts are application-computed and checked separately by the final-output gate.",
             "",
             "| Target | v1 | v2 |",
             "| --- | --- | --- |",
@@ -541,16 +630,18 @@ def render_comparison_report(results_by_version, run_ids=None):
             "fallback": _percentage(
                 sum(result["fallback_used"] for result in results), total
             ),
-            "route_matches_engine": _percentage(
-                sum(result["raw_checks"]["route_matches_engine"] for result in results),
+            "narrative_consistent_with_facts": _percentage(
+                sum(
+                    result["raw_checks"].get(
+                        "narrative_consistent_with_facts", False
+                    )
+                    for result in results
+                ),
                 total,
             ),
             "no_false_safe": _percentage(
                 sum(result["raw_checks"]["no_false_safe"] for result in results),
                 total,
-            ),
-            "no_risk_downgrade": _percentage(
-                _raw_no_risk_downgrade_passes(results), total
             ),
             "numbers_grounded": _percentage(
                 sum(result["raw_checks"]["numbers_grounded"] for result in results),
@@ -567,6 +658,9 @@ def render_comparison_report(results_by_version, run_ids=None):
         }
         target_results = {
             "fallback under 20%": rates["fallback"] < 20,
+            "narrative consistency above 90%": (
+                rates["narrative_consistent_with_facts"] > 90
+            ),
             "narrative no_false_safe above 90%": rates["no_false_safe"] > 90,
             "numbers_grounded above 90%": rates["numbers_grounded"] > 90,
             "route_ids_grounded above 90%": rates["route_ids_grounded"] > 90,
@@ -587,8 +681,8 @@ def render_comparison_report(results_by_version, run_ids=None):
     lines.extend(
         [
             "",
-            "Route selection, risk summaries, and forecast gaps are computed from the "
-            "plan by application code. The raw-model gate covers narrative quality; "
+            "Route selection, risk summaries, and forecast gaps are code-computed "
+            "facts. Narrative metrics evaluate only model-written prose and actions; "
             "the final-output gate verifies the assembled response.",
             "",
         ]
@@ -619,7 +713,8 @@ def write_raw_results(results, path, run_id, append=False):
                 "model": result["model"],
                 "prompt_version": result["prompt_version"],
                 "raw_model_text": result["raw_llm_output"],
-                "parsed_briefing": result["parsed_briefing"],
+                "model_narrative": result["parsed_narrative"],
+                "code_facts": result["code_facts"],
                 "expected_data_gaps": result["expected_data_gaps"],
                 "raw_checks": result["raw_checks"],
                 "final_checks": result["final_checks"],
@@ -673,7 +768,7 @@ def render_merged_report(records, raw_paths):
         "- Model: {}".format(", ".join(models)),
         "- Prompt version(s): {}".format(", ".join(prompts)),
         "- Run IDs: {}".format(", ".join(run_ids)),
-        "- Raw-check basis: model narrative composed with plan-derived route facts.",
+        "- Metrics separate code-computed facts from model-generated narrative.",
         "",
         "Records: {} | Timeout/error records: {}".format(
             total, sum(bool(record.get("error")) for record in records)
@@ -710,10 +805,31 @@ def render_merged_report(records, raw_paths):
             sum(float(record.get("wait_ms", 0.0)) for record in records)
         ),
         "",
-        "| Check | Raw pass rate |",
+        "## Facts (code-computed)",
+        "",
+        "| Fact check | Pass rate |",
         "| --- | ---: |",
     ]
-    for check in CHECK_NAMES:
+    for check in FACT_CHECK_NAMES:
+        passed = sum(
+            bool(record.get("raw_checks", {}).get(check, False))
+            for record in records
+        )
+        lines.append(
+            "| {} | {}/{} ({:.1f}%) |".format(
+                check, passed, total, _percentage(passed, total)
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Narrative (model-generated)",
+            "",
+            "| Narrative check | Raw pass rate |",
+            "| --- | ---: |",
+        ]
+    )
+    for check in NARRATIVE_CHECK_NAMES:
         passed = sum(
             bool(record.get("raw_checks", {}).get(check, False))
             for record in records
@@ -800,9 +916,10 @@ def load_thresholds(path=THRESHOLDS_PATH, section="final"):
         raise ValueError("Thresholds must define raw_model.minimum_pass_rates.")
     _validate_pass_rates(
         raw_pass_rates,
-        set(CHECK_NAMES) | {"no_risk_downgrade"},
+        set(NARRATIVE_CHECK_NAMES),
         "raw_model.minimum_pass_rates",
         required={
+            "narrative_consistent_with_facts",
             "no_false_safe",
             "numbers_grounded",
             "route_ids_grounded",
@@ -862,13 +979,6 @@ def quality_gate_failures(results, thresholds=None):
     return failures
 
 
-def _raw_no_risk_downgrade_passes(results):
-    return sum(
-        all(result["raw_checks"][check] for check in NO_RISK_DOWNGRADE_CHECKS)
-        for result in results
-    )
-
-
 def raw_model_gate_failures(results, thresholds=None):
     """Return raw-output and fallback-rate threshold violations."""
     if thresholds is None:
@@ -877,10 +987,7 @@ def raw_model_gate_failures(results, thresholds=None):
     total = len(results)
     failures = []
     for check, minimum in minimum_rates.items():
-        if check == "no_risk_downgrade":
-            passed = _raw_no_risk_downgrade_passes(results)
-        else:
-            passed = sum(result["raw_checks"][check] for result in results)
+        passed = sum(result["raw_checks"][check] for result in results)
         rate = passed / total if total else 0.0
         if rate < minimum:
             failures.append(
@@ -940,10 +1047,7 @@ def render_raw_model_gate(results, thresholds=None):
         "| --- | ---: | ---: | --- |",
     ]
     for check, minimum in thresholds["minimum_pass_rates"].items():
-        if check == "no_risk_downgrade":
-            passed = _raw_no_risk_downgrade_passes(results)
-        else:
-            passed = sum(result["raw_checks"][check] for result in results)
+        passed = sum(result["raw_checks"][check] for result in results)
         rate = passed / total if total else 0.0
         outcome = "PASS" if rate >= minimum else "FAIL"
         lines.append(

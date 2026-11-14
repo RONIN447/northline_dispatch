@@ -4,12 +4,14 @@ final:
   risk_counts_match_plan: 1.0
   risk_ranges_cover_checkpoints: 1.0
   data_gaps_match_plan: 1.0
+  narrative_consistent_with_facts: 1.0
   no_false_safe: 1.0
   numbers_grounded: 1.0
   route_ids_grounded: 1.0
   place_names_grounded: 1.0
 raw_model:
   minimum_pass_rates:
+    narrative_consistent_with_facts: 1.0
     no_false_safe: 0.91
     numbers_grounded: 0.91
     route_ids_grounded: 0.91

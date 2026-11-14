@@ -3,15 +3,48 @@
 import re
 from typing import Dict, List
 
-from evals.grounding import check_grounding
+from briefing.facts import compute_briefing_facts, expected_data_gaps, expected_route_risks
 from briefing.schema import Briefing
-from routing.risk_levels import HIGH, NO_TRAVEL, RISK_SCORES, SEVERE
+from evals.grounding import _ROUTE_ID_PATTERN, check_grounding
+from routing.risk_levels import NO_TRAVEL, RISK_SCORES, SEVERE
 
 _WEATHER_FIELDS = ("windMph", "rainInHr", "snowInHr")
+_RISK_LEVEL_PATTERN = re.compile(
+    r"\b(?P<verb>is|has|shows|faces|carries|rated as|worst(?:\s+checkpoint)?"
+    r"(?:\s+risk)?\s+is|worst(?:\s+checkpoint)?\s*:\s*)\s*"
+    r"(?:the\s+|a\s+)?(?P<level>No\s+Travel|Low|Moderate|High|Severe)"
+    r"(?:\s+risk)?\b",
+    re.IGNORECASE,
+)
+_NO_GAP_CLAIM = re.compile(
+    r"\b(?:forecast|weather)(?:\s+data)?\s+gaps?\s*:\s*"
+    r"(?:none|no(?:ne)?|not\s+present)\b|"
+    r"\bno\s+(?:required\s+)?(?:forecast|weather)(?:\s+data)?\s+gaps?\b|"
+    r"\b(?:all|every)\s+(?:required\s+)?(?:weather|forecast)\s+data\s+"
+    r"(?:is|are)\s+available\b",
+    re.IGNORECASE,
+)
+_GAP_PRESENT_CLAIM = re.compile(
+    r"\b(?:forecast|weather)(?:\s+data)?\s+gaps?\s*:\s*"
+    r"(?!\s*(?:none|no\b|not\s+present\b))[^.!?;\n]+|"
+    r"\b(?:forecast|weather)(?:\s+data)?\s+gaps?\s+"
+    r"(?:exist|are\s+present|remain\s+present)\b|"
+    r"\b(?:weather|forecast)\s+data\s+(?:is|are)\s+"
+    r"(?:missing|unavailable)\b",
+    re.IGNORECASE,
+)
+_RECOMMENDED_ROUTE_ID = re.compile(
+    r"\b(?:recommend(?:ed|ation)?|choose|chosen|select|selected)\b"
+    r"[^.!?;\n]{0,60}?(?P<route>route[-_\s]+\d+(?:[-_][A-Za-z0-9]+)*)\b|"
+    r"(?P<reverse>route[-_\s]+\d+(?:[-_][A-Za-z0-9]+)*)\b"
+    r"[^.!?;\n]{0,40}\b(?:is|as)\s+(?:the\s+)?"
+    r"(?:recommended|safest|best)\b",
+    re.IGNORECASE,
+)
 _FALSE_SAFE_CLAIM = re.compile(
     r"\b(?:safe(?:\s+to\s+(?:travel|drive|dispatch))?|"
     r"(?:the\s+)?route is clear|no\s+(?:weather\s+)?(?:risk|hazard)|"
-    r"proceed with (?:the )?(?:recommended )?route)\b",
+    r"no\s+elevated\s+risk|proceed with (?:the )?(?:recommended )?route)\b",
     re.IGNORECASE,
 )
 
@@ -57,6 +90,7 @@ def validate_briefing(briefing: Briefing, route_plan: dict) -> List[str]:
         briefing.data_gaps
     ):
         errors.append("data_gap_mismatch")
+    errors.extend(narrative_consistency_errors(briefing, route_plan))
 
     if _has_false_safe_claim(briefing, route_plan):
         errors.append("false_safe_claim")
@@ -72,7 +106,8 @@ def _has_false_safe_claim(briefing: Briefing, route_plan: dict) -> bool:
         if route["id"] == route_plan["recommendedRouteId"]
     )
     recommended_has_risk_or_gap = any(
-        RISK_SCORES.get(checkpoint.get("risk"), 0) >= RISK_SCORES[HIGH]
+        RISK_SCORES.get(checkpoint.get("risk"), 0)
+        >= RISK_SCORES["Moderate"]
         or any(checkpoint.get(field) is None for field in _WEATHER_FIELDS)
         for checkpoint in recommended_route["checkpoints"]
     )
@@ -123,6 +158,9 @@ def evaluate_checks(briefing: Briefing, route_plan: dict) -> Dict[str, bool]:
             expected_gaps == set(briefing.data_gaps)
             and len(briefing.data_gaps) == len(expected_gaps)
         ),
+        "narrative_consistent_with_facts": not narrative_consistency_errors(
+            briefing, route_plan
+        ),
         "no_false_safe": not false_safe_claim,
         "numbers_grounded": "unsupported_number" not in grounding_errors,
         "route_ids_grounded": "unsupported_route_id" not in grounding_errors,
@@ -130,54 +168,77 @@ def evaluate_checks(briefing: Briefing, route_plan: dict) -> Dict[str, bool]:
     }
 
 
-def expected_route_risks(route_plan: dict) -> List[dict]:
-    """Build canonical per-route risk summaries from engine-rated checkpoints."""
-    expected = []
-    for route in route_plan["routes"]:
-        checkpoints = route["checkpoints"]
-        if not checkpoints:
-            raise ValueError("Route {} has no checkpoints.".format(route["id"]))
-        for checkpoint in checkpoints:
-            if checkpoint.get("risk") not in RISK_SCORES:
-                raise ValueError("Route plan contains an unknown checkpoint risk.")
+def narrative_consistency_errors(briefing: Briefing, route_plan: dict) -> List[str]:
+    """Return conflicts between model narrative claims and computed plan facts."""
+    facts = compute_briefing_facts(route_plan)
+    claims = "{} {}".format(briefing.summary, " ".join(briefing.dispatcher_actions))
+    errors = []
+    if _has_wrong_recommendation_claim(claims, facts.recommended_route_id, route_plan):
+        errors.append("recommended_route_claim_mismatch")
+    if _has_wrong_risk_claim(claims, facts.route_risks, route_plan):
+        errors.append("risk_level_claim_mismatch")
+    has_gaps = bool(facts.data_gaps)
+    if (has_gaps and _NO_GAP_CLAIM.search(claims)) or (
+        not has_gaps and _GAP_PRESENT_CLAIM.search(claims)
+    ):
+        errors.append("forecast_gap_claim_mismatch")
+    return errors
 
-        worst_index = max(
-            range(len(checkpoints)),
-            key=lambda index: RISK_SCORES[checkpoints[index]["risk"]],
-        )
-        risk_summary = {
-            "route_id": route["id"],
-            "worst_checkpoint": {
-                "index": worst_index,
-                "level": checkpoints[worst_index]["risk"],
-            },
-            "severe_count": sum(
-                checkpoint["risk"] == SEVERE for checkpoint in checkpoints
-            ),
-            "no_travel_count": sum(
-                checkpoint["risk"] == NO_TRAVEL for checkpoint in checkpoints
-            ),
+
+def _has_wrong_recommendation_claim(claims, recommended_route_id, route_plan):
+    for sentence in re.split(r"[.!?;\n]+", claims):
+        for match in _RECOMMENDED_ROUTE_ID.finditer(sentence):
+            route_id = match.group("route") or match.group("reverse")
+            resolved = _resolve_route_id(route_id, route_plan)
+            if resolved is not None and resolved != recommended_route_id:
+                return True
+    return False
+
+
+def _has_wrong_risk_claim(claims, route_risks, route_plan):
+    worst_by_route = {
+        summary.route_id: summary.worst_checkpoint.level
+        for summary in route_risks
+    }
+    levels_by_route = {
+        route["id"]: {checkpoint.get("risk") for checkpoint in route["checkpoints"]}
+        for route in route_plan["routes"]
+    }
+    recommended_route_id = route_plan["recommendedRouteId"]
+    for sentence in re.split(r"[.!?;\n]+", claims):
+        route_ids = {
+            resolved
+            for match in _ROUTE_ID_PATTERN.finditer(sentence)
+            if (resolved := _resolve_route_id(match.group(), route_plan)) is not None
         }
-        risk_ranges = []
-        current_range = None
-        for checkpoint in checkpoints:
-            level = checkpoint["risk"]
-            if level in (SEVERE, NO_TRAVEL):
-                if current_range is not None and current_range["level"] == level:
-                    current_range["end_mile"] = checkpoint["mile"]
-                else:
-                    current_range = {
-                        "start_mile": checkpoint["mile"],
-                        "end_mile": checkpoint["mile"],
-                        "level": level,
-                    }
-                    risk_ranges.append(current_range)
-            else:
-                current_range = None
-        if risk_ranges:
-            risk_summary["risk_ranges"] = risk_ranges
-        expected.append(risk_summary)
-    return expected
+        if re.search(r"\brecommended\s+route\b", sentence, re.IGNORECASE):
+            route_ids.add(recommended_route_id)
+        if not route_ids:
+            continue
+        match = _RISK_LEVEL_PATTERN.search(sentence)
+        if not match:
+            continue
+        level = re.sub(r"\s+", " ", match.group("level")).title()
+        verb = re.sub(r"\s+", " ", match.group("verb")).casefold()
+        for route_id in route_ids:
+            if verb.startswith("worst") or verb == "is":
+                if level != worst_by_route[route_id]:
+                    return True
+            elif level not in levels_by_route[route_id]:
+                return True
+    return False
+
+
+def _resolve_route_id(candidate, route_plan):
+    normalized = re.sub(r"[^a-z0-9]", "", candidate.casefold())
+    for route in route_plan["routes"]:
+        route_id = str(route["id"])
+        if normalized == re.sub(r"[^a-z0-9]", "", route_id.casefold()):
+            return route_id
+        prefix = re.match(r"route[-_\s]*(\d+)", route_id, re.IGNORECASE)
+        if prefix and normalized == "route{}".format(prefix.group(1)):
+            return route_id
+    return None
 
 
 def _risk_ranges_cover_checkpoints(briefing: Briefing, route_plan: dict) -> bool:
@@ -200,18 +261,3 @@ def _risk_ranges_cover_checkpoints(briefing: Briefing, route_plan: dict) -> bool
             ):
                 return False
     return True
-
-
-def expected_data_gaps(route_plan: dict) -> List[str]:
-    """Return canonical gap descriptions for missing checkpoint weather fields."""
-    expected = []
-    for route in route_plan["routes"]:
-        for index, checkpoint in enumerate(route["checkpoints"]):
-            missing = [field for field in _WEATHER_FIELDS if checkpoint.get(field) is None]
-            if missing:
-                expected.append(
-                    "{} checkpoint {} is missing {}.".format(
-                        route["id"], index, ", ".join(missing)
-                    )
-                )
-    return expected

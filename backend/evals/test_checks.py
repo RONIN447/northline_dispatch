@@ -1,14 +1,17 @@
 """Fault injection tests for the independent briefing evaluation checks."""
 
 from decimal import Decimal, ROUND_HALF_UP
-import json
 import unittest
 
 from briefing.providers import MockProvider
-from briefing.schema import BriefingNarrative
 from briefing.service import generate_briefing
 from briefing.validator import enforce
-from evals.checks import evaluate_checks, expected_data_gaps, expected_route_risks
+from briefing.facts import (
+    compute_briefing_facts,
+    expected_data_gaps,
+    expected_route_risks,
+)
+from evals.checks import evaluate_checks
 from evals.grounding import check_grounding, find_offending_tokens
 from evals.scenarios import load_scenarios
 
@@ -28,13 +31,8 @@ class BriefingCheckTests(unittest.TestCase):
             if scenario["category"] == "forecast_unavailable"
         )
 
-    def test_each_check_fails_for_a_matching_faulty_mock_and_final_passes(self):
+    def test_narrative_checks_catch_faulty_model_outputs(self):
         cases = (
-            ("faulty_route", self.severe_scenario, "route_matches_engine"),
-            ("faulty_worst_checkpoint", self.severe_scenario, "worst_checkpoint_matches_engine"),
-            ("faulty_risk_count", self.severe_scenario, "risk_counts_match_plan"),
-            ("faulty_risk_range", self.severe_scenario, "risk_ranges_cover_checkpoints"),
-            ("faulty_no_gap", self.gap_scenario, "data_gaps_match_plan"),
             ("faulty_safe", self.severe_scenario, "no_false_safe"),
             ("faulty_number", self.severe_scenario, "numbers_grounded"),
             ("faulty_route_id", self.severe_scenario, "route_ids_grounded"),
@@ -43,37 +41,74 @@ class BriefingCheckTests(unittest.TestCase):
         for mode, scenario, failed_check in cases:
             with self.subTest(mode=mode, check=failed_check):
                 raw, _ = generate_briefing(
-                    scenario["plan"], provider=MockProvider("normal")
+                    scenario["plan"], provider=MockProvider(mode)
                 )
-                if mode == "faulty_route":
-                    raw.recommended_route_id = next(
-                        route["id"]
-                        for route in scenario["plan"]["routes"]
-                        if route["id"] != raw.recommended_route_id
-                    )
-                elif mode == "faulty_worst_checkpoint":
-                    item = raw.route_risks[0].worst_checkpoint
-                    item.level = "Low" if item.level != "Low" else "Moderate"
-                elif mode == "faulty_risk_count":
-                    raw.route_risks[0].severe_count += 1
-                elif mode == "faulty_risk_range":
-                    item = next(item for item in raw.route_risks if item.risk_ranges)
-                    item.risk_ranges = []
-                elif mode == "faulty_no_gap":
-                    raw.data_gaps = []
-                else:
-                    response = MockProvider(mode).generate(
-                        "", json.dumps(scenario["plan"])
-                    )
-                    narrative = BriefingNarrative.model_validate_json(response.text)
-                    raw.summary = narrative.summary
-                    raw.dispatcher_actions = narrative.dispatcher_actions
                 raw_checks = evaluate_checks(raw, scenario["plan"])
                 self.assertFalse(raw_checks[failed_check])
 
                 final, _, _ = enforce(scenario["plan"], raw)
                 final_checks = evaluate_checks(final, scenario["plan"])
                 self.assertTrue(all(final_checks.values()), final_checks)
+
+    def test_code_computes_recommendation_risks_and_gaps(self):
+        facts = compute_briefing_facts(self.gap_scenario["plan"])
+
+        self.assertEqual(
+            facts.recommended_route_id,
+            self.gap_scenario["plan"]["recommendedRouteId"],
+        )
+        self.assertEqual(
+            [item.route_id for item in facts.route_risks],
+            [route["id"] for route in self.gap_scenario["plan"]["routes"]],
+        )
+        self.assertEqual(
+            facts.data_gaps, expected_data_gaps(self.gap_scenario["plan"])
+        )
+
+    def test_narrative_cannot_recommend_a_different_valid_route(self):
+        scenario = self.severe_scenario
+        briefing, _ = generate_briefing(
+            scenario["plan"], provider=MockProvider("normal")
+        )
+        alternative = next(
+            route["id"]
+            for route in scenario["plan"]["routes"]
+            if route["id"] != briefing.recommended_route_id
+        )
+        briefing.summary = "I recommend {} for dispatch.".format(alternative)
+
+        checks = evaluate_checks(briefing, scenario["plan"])
+
+        self.assertTrue(checks["route_ids_grounded"])
+        self.assertFalse(checks["narrative_consistent_with_facts"])
+
+    def test_narrative_cannot_downgrade_the_recommended_route_risk(self):
+        scenario = self.severe_scenario
+        briefing, _ = generate_briefing(
+            scenario["plan"], provider=MockProvider("normal")
+        )
+        recommended_risk = next(
+            item
+            for item in briefing.route_risks
+            if item.route_id == briefing.recommended_route_id
+        ).worst_checkpoint.level
+        self.assertNotEqual(recommended_risk, "Low")
+        briefing.summary = "The recommended route is Low risk."
+
+        checks = evaluate_checks(briefing, scenario["plan"])
+
+        self.assertFalse(checks["narrative_consistent_with_facts"])
+
+    def test_narrative_gap_statement_must_match_plan(self):
+        scenario = self.gap_scenario
+        briefing, _ = generate_briefing(
+            scenario["plan"], provider=MockProvider("normal")
+        )
+        briefing.summary = "Forecast gaps: none."
+
+        checks = evaluate_checks(briefing, scenario["plan"])
+
+        self.assertFalse(checks["narrative_consistent_with_facts"])
 
     def test_rule_based_mock_passes_all_checks_on_all_scenarios(self):
         for scenario in load_scenarios():

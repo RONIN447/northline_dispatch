@@ -9,7 +9,7 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
 django.setup()
 
 from briefing.views import _validate_plan_shape
-from evals.checks import expected_data_gaps, expected_route_risks
+from briefing.facts import expected_data_gaps, expected_route_risks
 from evals.scenarios import EXPECTED_CATEGORY_COUNTS, load_scenarios
 from routing.risk_levels import HIGH, LOW, NO_TRAVEL, RISK_LEVELS, RISK_SCORES
 from routing.views import rank_route_summaries, recompute_route_risk_summary

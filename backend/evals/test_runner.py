@@ -79,10 +79,8 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertIn("Provider: mock", report)
         self.assertIn("Mode: report", report)
         self.assertIn("Model: rule-based", report)
-        self.assertIn(
-            "Raw-check basis: model narrative composed with plan-derived route facts.",
-            report,
-        )
+        self.assertIn("## Facts (code-computed)", report)
+        self.assertIn("## Narrative (model-generated)", report)
         self.assertIn("Prompt version: v1", report)
         self.assertIn("Pass rates by scenario category", report)
         self.assertIn("| severe | 1 |", report)
@@ -187,9 +185,27 @@ class EvaluationRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         self.assertIn("timed out", results[0]["error"])
-        self.assertIsNone(results[0]["parsed_briefing"])
-        self.assertTrue(all(not passed for passed in results[0]["raw_checks"].values()))
-        self.assertIsNone(records[0]["parsed_briefing"])
+        self.assertIsNone(results[0]["parsed_narrative"])
+        self.assertTrue(
+            all(results[0]["raw_checks"][check] for check in (
+                "route_matches_engine",
+                "worst_checkpoint_matches_engine",
+                "risk_counts_match_plan",
+                "risk_ranges_cover_checkpoints",
+                "data_gaps_match_plan",
+            ))
+        )
+        self.assertTrue(
+            all(not results[0]["raw_checks"][check] for check in (
+                "narrative_consistent_with_facts",
+                "no_false_safe",
+                "numbers_grounded",
+                "route_ids_grounded",
+                "place_names_grounded",
+            ))
+        )
+        self.assertIsNone(records[0]["model_narrative"])
+        self.assertIn("recommended_route_id", records[0]["code_facts"])
         self.assertIn("timed out", records[0]["error"])
         self.assertIsNone(records[1]["error"])
         self.assertEqual(records[1]["scenario_id"], scenarios[1]["id"])
@@ -234,8 +250,12 @@ class EvaluationRunnerTests(unittest.TestCase):
         record = records[0]
         self.assertIn("999 hours", record["raw_model_text"])
         self.assertEqual(
-            record["parsed_briefing"]["recommended_route_id"],
+            record["code_facts"]["recommended_route_id"],
             scenario["plan"]["recommendedRouteId"],
+        )
+        self.assertEqual(
+            set(record["model_narrative"]),
+            {"summary", "dispatcher_actions"},
         )
         self.assertIn("expected_data_gaps", record)
         self.assertEqual(record["failed_checks"][0]["check"], "numbers_grounded")
@@ -403,15 +423,15 @@ class EvaluationRunnerTests(unittest.TestCase):
 
         self.assertIn("| Metric | v1 | v2 |", report)
         self.assertIn("| Fallback rate | 0/1 (0.0%) | 1/1 (100.0%) |", report)
-        self.assertIn("| Raw: numbers_grounded | 1/1 (100.0%) |", report)
-        self.assertIn("| Raw: no_risk_downgrade (derived) | 1/1 (100.0%) |", report)
+        self.assertIn("| Model narrative: numbers_grounded | 1/1 (100.0%) |", report)
+        self.assertIn(
+            "| Model narrative: narrative_consistent_with_facts | 1/1 (100.0%) |",
+            report,
+        )
         self.assertIn("fallback under 20%", report)
         self.assertIn("- Mode: prompt comparison", report)
         self.assertIn("- Provider: mock", report)
-        self.assertIn(
-            "- Raw-check basis: model narrative composed with plan-derived route facts.",
-            report,
-        )
+        self.assertIn("Route and risk facts are application-computed", report)
         self.assertIn("raw/run-v1.jsonl", report)
 
     def test_comparison_report_requires_same_scenario_set(self):
@@ -442,6 +462,7 @@ class EvaluationRunnerTests(unittest.TestCase):
         self.assertEqual(
             set(thresholds["minimum_pass_rates"]),
             {
+                "narrative_consistent_with_facts",
                 "no_false_safe",
                 "numbers_grounded",
                 "route_ids_grounded",
@@ -772,6 +793,7 @@ class EvaluationRunnerTests(unittest.TestCase):
             "risk_counts_match_plan": True,
             "risk_ranges_cover_checkpoints": True,
             "data_gaps_match_plan": True,
+            "narrative_consistent_with_facts": True,
             "no_false_safe": True,
             "numbers_grounded": True,
             "route_ids_grounded": True,

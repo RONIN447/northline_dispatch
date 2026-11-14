@@ -123,11 +123,6 @@ def check_grounding(briefing, route_plan):
     """Return grounding violations in the summary and dispatcher actions."""
     claims = "{} {}".format(briefing.summary, " ".join(briefing.dispatcher_actions))
     unsupported_routes = _unsupported_route_ids(claims, route_plan)
-    if any(
-        not _route_id_is_grounded(item.route_id, route_plan)
-        for item in briefing.route_risks
-    ):
-        unsupported_routes.append("route_risk.route_id")
 
     claims_without_route_ids = _ROUTE_ID_PATTERN.sub("", claims)
     unsupported_numbers = _unsupported_numbers(claims_without_route_ids, route_plan)
@@ -148,11 +143,6 @@ def find_offending_tokens(briefing, route_plan):
     claims = "{} {}".format(briefing.summary, " ".join(briefing.dispatcher_actions))
     claims_without_route_ids = _ROUTE_ID_PATTERN.sub("", claims)
     route_ids = _unsupported_route_ids(claims, route_plan)
-    route_ids.extend(
-        item.route_id
-        for item in briefing.route_risks
-        if not _route_id_is_grounded(item.route_id, route_plan)
-    )
     return {
         "numbers": _unsupported_numbers(claims_without_route_ids, route_plan),
         "route_ids": list(dict.fromkeys(route_ids)),

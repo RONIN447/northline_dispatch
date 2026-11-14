@@ -671,10 +671,14 @@ function BriefingPanel({ result, isLoading, errorMessage, onGenerate }) {
 
       {briefing ? (
         <div className="briefing-content">
-          <p className="briefing-summary">{briefing.summary}</p>
-          {briefing.route_risks.length > 0 && (
-            <div className="briefing-section">
-              <b>Route risk summary</b>
+          <div className="briefing-section">
+            <b>Model-written narrative</b>
+            <p className="briefing-summary">{briefing.summary}</p>
+          </div>
+          <div className="briefing-section">
+            <b>Code-computed facts</b>
+            <p>Recommended route: <strong>{briefing.recommended_route_id}</strong></p>
+            {briefing.route_risks.length > 0 && (
               <ul className="briefing-route-risk-list">
                 {briefing.route_risks.map((routeRisk) => (
                   <li key={routeRisk.route_id}>
@@ -709,17 +713,18 @@ function BriefingPanel({ result, isLoading, errorMessage, onGenerate }) {
                   </li>
                 ))}
               </ul>
-            </div>
-          )}
-          {briefing.data_gaps.length > 0 && (
-            <div className="briefing-section">
-              <b>Forecast data gaps</b>
-              <ul>{briefing.data_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>
-            </div>
-          )}
+            )}
+            {briefing.data_gaps.length > 0 && (
+              <div>
+                <b>Forecast data gaps</b>
+                <ul>{briefing.data_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>
+              </div>
+            )}
+            {briefing.data_gaps.length === 0 && <p>Forecast gaps: none.</p>}
+          </div>
           {briefing.dispatcher_actions.length > 0 && (
             <div className="briefing-section">
-              <b>Dispatcher actions</b>
+              <b>Dispatcher actions (model-written)</b>
               <ul>{briefing.dispatcher_actions.map((action) => <li key={action}>{action}</li>)}</ul>
             </div>
           )}

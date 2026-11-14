@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from briefing.facts import compute_briefing_facts
 from briefing.schema import BriefingNarrative
-from evals.checks import expected_route_risks
 
 PROVIDER_TIMEOUT_SECONDS = 20.0
 GUNICORN_TIMEOUT_SECONDS = 45
@@ -70,8 +70,13 @@ class MockProvider:
             request_data = json.loads(match.group(1) if match else user)
         except (TypeError, json.JSONDecodeError) as error:
             raise ValueError("Mock provider input must be a JSON route plan.") from error
-        route_plan = request_data.get("plan", request_data)
-        narrative = self._build_narrative(route_plan)
+        route_plan = request_data.get(
+            "route_plan", request_data.get("plan", request_data)
+        )
+        facts = request_data.get("briefing_facts")
+        if facts is None:
+            facts = compute_briefing_facts(route_plan).model_dump(mode="json")
+        narrative = self._build_narrative(route_plan, facts)
         if self.mode in {"faulty", "faulty_number"}:
             narrative.summary += " Estimated delay: 999 hours."
         if self.mode in {"faulty", "faulty_place"}:
@@ -91,8 +96,8 @@ class MockProvider:
         )
 
     @staticmethod
-    def _build_narrative(route_plan: dict) -> BriefingNarrative:
-        recommended_route_id = route_plan["recommendedRouteId"]
+    def _build_narrative(route_plan: dict, facts: dict) -> BriefingNarrative:
+        recommended_route_id = facts["recommended_route_id"]
         recommended_route = next(
             (route for route in route_plan["routes"] if route["id"] == recommended_route_id),
             None,
@@ -100,36 +105,32 @@ class MockProvider:
         if recommended_route is None:
             raise ValueError("Route plan has no route matching recommendedRouteId.")
 
-        route_risks = expected_route_risks(route_plan)
+        route_risks = facts["route_risks"]
         recommended_risks = next(
-            item for item in route_risks if item["route_id"] == recommended_route_id
+            item
+            for item in route_risks
+            if item["route_id"] == recommended_route_id
         )
-        has_forecast_gap = any(
-            checkpoint.get(field) is None
-            for route in route_plan["routes"]
-            for checkpoint in route["checkpoints"]
-            for field in ("windMph", "rainInHr", "snowInHr")
-        )
+        has_forecast_gap = bool(facts["data_gaps"])
         gap_intro = (
             "Forecast gaps: required weather data is unavailable."
             if has_forecast_gap
             else "Forecast gaps: none."
         )
-        if recommended_risks["no_travel_count"]:
-            risk_text = "The recommended route has No Travel risk."
+        worst_level = recommended_risks["worst_checkpoint"]["level"]
+        if worst_level == "No Travel":
             action = "hold dispatch for review."
-        elif recommended_risks["severe_count"]:
-            risk_text = "The recommended route has Severe risk."
+        elif worst_level == "Severe":
             action = "review Severe checkpoints before dispatch."
-        elif any(
-            checkpoint.get("risk") == "High"
-            for checkpoint in recommended_route["checkpoints"]
-        ):
-            risk_text = "The recommended route has High risk."
+        elif worst_level == "High":
             action = "brief the driver on elevated-risk checkpoints."
+        elif worst_level == "Moderate":
+            action = "monitor Moderate checkpoints before dispatch."
         else:
-            risk_text = "The recommended route has no elevated risk in the plan."
             action = "monitor checkpoint forecasts before dispatch."
+        risk_text = "The recommended route's worst checkpoint is {}.".format(
+            worst_level
+        )
 
         return BriefingNarrative(
             summary="{} {} {}".format(gap_intro, recommended_route_id, risk_text),
